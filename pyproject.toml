@@ -107,4 +107,26 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "class .*\\bProtocol\\):",
     "@(abc\\.)?abstractmethod",
-]
+]# 添加到 pyproject.toml 末尾
+
+[project.scripts]
+memory-optimize = "scripts.run_optimization:main"
+
+[tool.black]
+line-length = 88
+include = '\\.pyi?$'
+exclude = '''
+/(\\.eggs | \\.git | \\.hg | \\.mypy_cache | \\.tox | \\.venv | venv | _build | buck-out | build | dist)/
+'''
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.isort]
+profile = "black"
+line_length = 88
+multi_line_output = 3
+include_trailing_comma = true
