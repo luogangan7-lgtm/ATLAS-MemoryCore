@@ -415,3 +415,14 @@ class MemoryStorage:
         except Exception as e:
             logger.error(f"清空记忆失败: {e}")
             return False
+
+
+# 全局实例
+_default_storage = None
+
+def get_default_storage() -> MemoryStorage:
+    """获取默认存储实例"""
+    global _default_storage
+    if _default_storage is None:
+        _default_storage = MemoryStorage()
+    return _default_storage

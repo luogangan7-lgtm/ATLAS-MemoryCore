@@ -9,13 +9,13 @@ __license__ = "MIT"
 from .core.embedding import EmbeddingModel
 from .core.storage import MemoryStorage
 from .core.retrieval import MemoryRetrieval
-from .core.scoring import MemoryScoring
+from .core.scoring import MemoryScoringEngine
 # from .integration.openclaw import AtlasMemorySkill  # TODO: 待实现
 
 __all__ = [
     "EmbeddingModel",
     "MemoryStorage", 
     "MemoryRetrieval",
-    "MemoryScoring",
+    "MemoryScoringEngine",
     # "AtlasMemorySkill",  # TODO: 待实现
 ]

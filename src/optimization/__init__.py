@@ -4,12 +4,10 @@
 Implements self-optimization functionality for memory system
 """
 
-from .compressor import MemoryCompressor
-from .optimizer import MemoryOptimizer
-from .scheduler import OptimizationScheduler
+from .self_optimization import SelfOptimizationLoop
+from .token_optimizer import TokenOptimizer
 
 __all__ = [
-    "MemoryCompressor",
-    "MemoryOptimizer", 
-    "OptimizationScheduler",
+    "SelfOptimizationLoop",
+    "TokenOptimizer", 
 ]

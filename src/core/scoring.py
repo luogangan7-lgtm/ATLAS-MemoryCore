@@ -170,8 +170,16 @@ class MemoryScoringEngine:
         
         for usage in usage_history:
             use_time = usage.get("timestamp")
-            if use_time and use_time >= week_ago:
-                recent_uses += 1
+            if use_time:
+                # 转换字符串时间为datetime
+                if isinstance(use_time, str):
+                    try:
+                        use_time = datetime.fromisoformat(use_time.replace('Z', '+00:00'))
+                    except:
+                        continue
+                
+                if use_time >= week_ago:
+                    recent_uses += 1
         
         # 归一化到0-1
         if recent_uses == 0:
