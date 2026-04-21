@@ -1,0 +1,445 @@
+# ATLAS-MemoryCore V6.0 Kubernetes部署
+# Phase 2: 生产环境K8s编排
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: atlas-memory
+  labels:
+    name: atlas-memory
+    environment: production
+---
+# 配置映射
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: atlas-config
+  namespace: atlas-memory
+data:
+  log-level: "INFO"
+  qdrant-mode: "local"
+  model-cache-dir: "/app/data/models"
+  embedding-model: "nomic-embed-text-v1.5"
+  compression-model: "Qwen/Qwen2.5-7B-Instruct"
+---
+# 密钥配置
+apiVersion: v1
+kind: Secret
+metadata:
+  name: atlas-secrets
+  namespace: atlas-memory
+type: Opaque
+data:
+  # 使用 base64 编码的密码
+  # echo -n "yourpassword" | base64
+  redis-password: "YXRsYXMxMjM="  # atlas123
+  postgres-password: "YXRsYXMxMjM="  # atlas123
+---
+# Qdrant向量数据库服务
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qdrant
+  namespace: atlas-memory
+  labels:
+    app: qdrant
+    component: vector-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+    spec:
+      containers:
+      - name: qdrant
+        image: qdrant/qdrant:v1.7.4
+        ports:
+        - containerPort: 6333
+          name: http
+        - containerPort: 6334
+          name: grpc
+        volumeMounts:
+        - name: qdrant-storage
+          mountPath: /qdrant/storage
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /readyz
+            port: 6333
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 6333
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: qdrant-storage
+        persistentVolumeClaim:
+          claimName: qdrant-pvc
+---
+# Qdrant服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant-service
+  namespace: atlas-memory
+spec:
+  selector:
+    app: qdrant
+  ports:
+  - name: http
+    port: 6333
+    targetPort: 6333
+  - name: grpc
+    port: 6334
+    targetPort: 6334
+  type: ClusterIP
+---
+# ATLAS主应用部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlas-memory-core
+  namespace: atlas-memory
+  labels:
+    app: atlas-memory-core
+    component: main
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: atlas-memory-core
+  template:
+    metadata:
+      labels:
+        app: atlas-memory-core
+    spec:
+      containers:
+      - name: atlas
+        image: atlas-memory-core:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: QDRANT_URL
+          value: "qdrant-service:6333"
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: atlas-config
+              key: log-level
+        - name: MODEL_CACHE_DIR
+          valueFrom:
+            configMapKeyRef:
+              name: atlas-config
+              key: model-cache-dir
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: atlas-secrets
+              key: redis-password
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: atlas-secrets
+              key: postgres-password
+        volumeMounts:
+        - name: data-volume
+          mountPath: /app/data
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: models-volume
+          mountPath: /app/data/models
+          readOnly: true
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: atlas-data-pvc
+      - name: config-volume
+        configMap:
+          name: atlas-config
+      - name: models-volume
+        persistentVolumeClaim:
+          claimName: models-pvc
+---
+# ATLAS服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlas-service
+  namespace: atlas-memory
+spec:
+  selector:
+    app: atlas-memory-core
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+# Redis缓存部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: atlas-memory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: atlas-secrets
+              key: redis-password
+        command: ["redis-server", "--appendonly", "yes", "--requirepass", "$(REDIS_PASSWORD)"]
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: redis-pvc
+---
+# Redis服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: atlas-memory
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+  type: ClusterIP
+---
+# PostgreSQL数据库部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: atlas-memory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: "atlas"
+        - name: POSTGRES_USER
+          value: "atlas"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: atlas-secrets
+              key: postgres-password
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - atlas
+          initialDelaySeconds: 60
+          periodSeconds: 30
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+---
+# PostgreSQL服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: atlas-memory
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+---
+# 定时任务CronJob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: atlas-optimizer
+  namespace: atlas-memory
+spec:
+  schedule: "0 2 * * *"  # 每天凌晨2点运行
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: optimizer
+            image: atlas-memory-core:latest
+            imagePullPolicy: IfNotPresent
+            command: ["python", "-m", "src", "optimize", "--full"]
+            env:
+            - name: QDRANT_URL
+              value: "qdrant-service:6333"
+            - name: LOG_LEVEL
+              value: "INFO"
+            volumeMounts:
+            - name: data-volume
+              mountPath: /app/data
+            resources:
+              requests:
+                memory: "2Gi"
+                cpu: "500m"
+              limits:
+                memory: "4Gi"
+                cpu: "2000m"
+          restartPolicy: OnFailure
+          volumes:
+          - name: data-volume
+            persistentVolumeClaim:
+              claimName: atlas-data-pvc
+---
+# 持久化存储声明
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qdrant-pvc
+  namespace: atlas-memory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: atlas-data-pvc
+  namespace: atlas-memory
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-pvc
+  namespace: atlas-memory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: atlas-memory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: models-pvc
+  namespace: atlas-memory
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi  # 大型模型文件需要更多空间

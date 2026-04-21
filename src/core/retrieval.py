@@ -71,11 +71,11 @@ class MemoryCache:
 
     def _evict_if_needed(self):
         """如果需要则驱逐缓存 - Evict cache if needed"""
-        if len(self.cache) > self.max_size:
-            # 移除最久未访问的
-            while len(self.cache) > self.max_size and self.access_order:
-                oldest_key = self.access_order.pop(0)
-                self.cache.pop(oldest_key, None)
+        # 注意：这里使用 > 而不是 >=，因为当缓存大小等于max_size时不需要驱逐
+        # 只有当超过max_size时才需要驱逐
+        while len(self.cache) > self.max_size and self.access_order:
+            oldest_key = self.access_order.pop(0)
+            self.cache.pop(oldest_key, None)
 
     def get(
         self, query: str, filters: Optional[Dict] = None
@@ -97,10 +97,14 @@ class MemoryCache:
     def set(self, query: str, filters: Optional[Dict], results: List[SearchResult]):
         """设置缓存结果 - Set cache results"""
         self._clean_expired()
-        self._evict_if_needed()
 
         key = self._generate_key(query, filters)
+        
+        # 先添加新条目
         self.cache[key] = (results, time.time())
+        
+        # 然后检查是否需要驱逐（因为添加后可能超过max_size）
+        self._evict_if_needed()
 
         if key in self.access_order:
             self.access_order.remove(key)

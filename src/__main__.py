@@ -1,394 +1,306 @@
 """
-ATLAS Memory Core 主入口点 - Main Entry Point
-提供命令行接口和快速启动功能
-Provides command line interface and quick start functionality
+ATLAS-MemoryCore V6.0 主入口点
+融合架构：自优化记忆体 + Aegis-Cortex Token经济学
 """
 
 import sys
 import argparse
-import logging
+import time
+from datetime import datetime
 from typing import Optional
 
-from .core.config import ConfigManager, get_config_manager
-from .core.embedding import EmbeddingModel
-from .core.storage import MemoryStorage
-from .core.retrieval import MemoryRetrieval, create_retrieval_system
-from .core.scoring import MemoryScoring, create_scoring_system
-
-logger = logging.getLogger(__name__)
-
-
-def setup_logging(level: str = "INFO", log_file: Optional[str] = None):
-    """设置日志配置 - Setup logging configuration"""
-    log_level = getattr(logging, level.upper(), logging.INFO)
-
-    handlers = [logging.StreamHandler(sys.stdout)]
-
-    if log_file:
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        handlers.append(file_handler)
-
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=handlers,
-    )
-
-
-def test_connection(config_path: Optional[str] = None):
-    """测试系统连接 - Test system connections"""
-    print("🔍 测试系统连接...")
-
-    try:
-        # 测试配置
-        config_manager = get_config_manager(config_path)
-        config = config_manager.config
-        print(f"✅ 配置加载成功: {config.version}")
-
-        # 测试嵌入模型
-        print("🧠 测试嵌入模型...")
-        embedding = EmbeddingModel()
-        test_text = "测试文本"
-        vector = embedding.encode_single(test_text)
-        print(f"✅ 嵌入模型正常，维度: {len(vector)}")
-
-        # 测试存储连接
-        print("💾 测试存储连接...")
-        storage = MemoryStorage(
-            qdrant_url=config.storage.qdrant_url,
-            collection_name=config.storage.collection_name,
-            embedding_model=embedding,
-            vector_size=config_manager.get_embedding_dimension(),
-        )
-        stats = storage.get_stats()
-        print(f"✅ 存储连接正常: {stats.get('total_memories', 0)} 条记忆")
-
-        # 测试检索系统
-        print("🔎 测试检索系统...")
-        retrieval = create_retrieval_system(
-            qdrant_url=config.storage.qdrant_url,
-            collection_name=config.storage.collection_name,
-            config_path=config_path,
-        )
-        print("✅ 检索系统正常")
-
-        # 测试评分系统
-        print("📊 测试评分系统...")
-        scoring = create_scoring_system(config_path)
-        print("✅ 评分系统正常")
-
-        print("\n🎉 所有系统测试通过！")
-        return True
-
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        return False
-
-
-def interactive_mode(config_path: Optional[str] = None):
-    """交互模式 - Interactive mode"""
-    print("🏔️ ATLAS Memory Core 交互模式")
-    print("=" * 50)
-
-    # 初始化系统
-    try:
-        retrieval = create_retrieval_system(config_path=config_path)
-        scoring = create_scoring_system(config_path)
-
-        from .core.storage import MemoryStorage, MemoryMetadata, MemoryCategory
-
-        storage = retrieval.memory_storage
-
-        print("✅ 系统初始化完成")
-        print(f"📊 当前记忆数量: {storage.get_stats().get('total_memories', 0)}")
-        print()
-
-    except Exception as e:
-        print(f"❌ 系统初始化失败: {e}")
-        return
-
-    while True:
-        print("\n请选择操作:")
-        print("  1. 存储记忆")
-        print("  2. 搜索记忆")
-        print("  3. 查看统计")
-        print("  4. 测试评分")
-        print("  5. 退出")
-
-        try:
-            choice = input("\n请输入选项 (1-5): ").strip()
-
-            if choice == "1":
-                # 存储记忆
-                text = input("请输入记忆内容: ").strip()
-                if not text:
-                    print("❌ 记忆内容不能为空")
-                    continue
-
-                category_input = input(
-                    "请输入分类 (learning/trading/code/personal/work/project/other): "
-                ).strip()
-                try:
-                    category = MemoryCategory(category_input.lower())
-                except ValueError:
-                    category = MemoryCategory.OTHER
-                    print(f"⚠️  使用默认分类: {category.value}")
-
-                importance_input = input("请输入重要性 (0.0-1.0，默认0.5): ").strip()
-                try:
-                    importance = float(importance_input) if importance_input else 0.5
-                    importance = max(0.0, min(1.0, importance))
-                except ValueError:
-                    importance = 0.5
-                    print(f"⚠️  使用默认重要性: {importance}")
-
-                tags_input = input("请输入标签 (逗号分隔，可选): ").strip()
-                tags = (
-                    [tag.strip() for tag in tags_input.split(",")] if tags_input else []
-                )
-
-                metadata = MemoryMetadata(
-                    category=category, importance=importance, tags=tags
-                )
-
-                memory_id = storage.store(text, metadata)
-                print(f"✅ 记忆存储成功: {memory_id[:8]}")
-
-            elif choice == "2":
-                # 搜索记忆
-                query = input("请输入搜索查询: ").strip()
-                if not query:
-                    print("❌ 搜索查询不能为空")
-                    continue
-
-                limit_input = input("请输入返回数量 (默认5): ").strip()
-                limit = int(limit_input) if limit_input.isdigit() else 5
-
-                threshold_input = input("请输入相似度阈值 (0.0-1.0，默认0.7): ").strip()
-                try:
-                    threshold = float(threshold_input) if threshold_input else 0.7
-                    threshold = max(0.0, min(1.0, threshold))
-                except ValueError:
-                    threshold = 0.7
-
-                results = retrieval.search(
-                    query, limit=limit, threshold=threshold, explain=True
-                )
-
-                if results:
-                    print(f"\n🔍 找到 {len(results)} 条相关记忆:")
-                    for i, result in enumerate(results, 1):
-                        print(
-                            f"\n{i}. [{result.relevance:.2f}] {result.memory.text[:100]}..."
-                        )
-                        print(f"   分类: {result.memory.metadata.category.value}")
-                        print(f"   重要性: {result.memory.metadata.importance:.2f}")
-                        print(f"   解释: {result.explanation}")
-                else:
-                    print("❌ 未找到相关记忆")
-
-            elif choice == "3":
-                # 查看统计
-                stats = storage.get_stats()
-                print("\n📊 系统统计:")
-                for key, value in stats.items():
-                    print(f"  {key}: {value}")
-
-                cache_stats = retrieval.get_cache_stats()
-                print("\n📦 缓存统计:")
-                for key, value in cache_stats.items():
-                    print(f"  {key}: {value}")
-
-            elif choice == "4":
-                # 测试评分
-                # 获取一些记忆进行评分
-                from .core.storage import MemoryCategory
-
-                test_memories = []
-                for category in MemoryCategory:
-                    memories = retrieval.search_by_category(category, limit=2)
-                    test_memories.extend(memories)
-
-                if test_memories:
-                    print(f"\n📊 测试 {len(test_memories)} 条记忆的评分:")
-                    for memory in test_memories[:5]:  # 只显示前5条
-                        score = scoring.calculate_score(memory)
-                        print(f"\n  ID: {memory.id[:8]}")
-                        print(f"  文本: {memory.text[:80]}...")
-                        print(f"  分类: {memory.metadata.category.value}")
-                        print(f"  重要性: {memory.metadata.importance:.2f}")
-                        print(f"  评分: {score:.3f}")
-                else:
-                    print("❌ 没有可测试的记忆")
-
-            elif choice == "5":
-                print("👋 退出交互模式")
-                break
-
-            else:
-                print("❌ 无效选项")
-
-        except KeyboardInterrupt:
-            print("\n👋 用户中断")
-            break
-        except Exception as e:
-            print(f"❌ 操作失败: {e}")
-
-
-def create_sample_data(config_path: Optional[str] = None):
-    """创建示例数据 - Create sample data"""
-    print("📝 创建示例数据...")
-
-    try:
-        retrieval = create_retrieval_system(config_path=config_path)
-        storage = retrieval.memory_storage
-
-        from .core.storage import MemoryMetadata, MemoryCategory
-
-        sample_memories = [
-            {
-                "text": "今天学习了Python异步编程，asyncio库非常强大，可以高效处理并发任务",
-                "metadata": MemoryMetadata(
-                    category=MemoryCategory.LEARNING,
-                    importance=0.8,
-                    tags=["python", "async", "asyncio", "concurrency"],
-                ),
-            },
-            {
-                "text": "比特币价格突破70,000美元，市场情绪乐观，可以考虑分批建仓",
-                "metadata": MemoryMetadata(
-                    category=MemoryCategory.TRADING,
-                    importance=0.9,
-                    tags=["bitcoin", "trading", "crypto", "investment"],
-                ),
-            },
-            {
-                "text": "完成了OpenClaw Skill开发文档，准备发布到GitHub，使用MIT许可证",
-                "metadata": MemoryMetadata(
-                    category=MemoryCategory.PROJECT,
-                    importance=0.7,
-                    tags=["openclaw", "github", "documentation", "opensource"],
-                ),
-            },
-            {
-                "text": "使用Qdrant向量数据库存储AI记忆，性能很好，支持混合搜索",
-                "metadata": MemoryMetadata(
-                    category=MemoryCategory.CODE,
-                    importance=0.6,
-                    tags=["qdrant", "vector-database", "ai", "search"],
-                ),
-            },
-            {
-                "text": "明天上午10点有团队会议，需要准备项目进度报告",
-                "metadata": MemoryMetadata(
-                    category=MemoryCategory.WORK,
-                    importance=0.5,
-                    tags=["meeting", "work", "schedule"],
-                ),
-            },
-        ]
-
-        created_count = 0
-        for memory_data in sample_memories:
-            try:
-                memory_id = storage.store(
-                    text=memory_data["text"], metadata=memory_data["metadata"]
-                )
-                created_count += 1
-                print(f"  ✅ 创建: {memory_data['text'][:50]}...")
-            except Exception as e:
-                print(f"  ❌ 失败: {e}")
-
-        print(f"\n🎉 示例数据创建完成: {created_count}/{len(sample_memories)} 条")
-
-        # 测试搜索
-        print("\n🔍 测试搜索功能...")
-        results = retrieval.search("Python编程", limit=2)
-        if results:
-            print("✅ 搜索功能正常")
-        else:
-            print("⚠️  搜索未返回结果")
-
-        return True
-
-    except Exception as e:
-        print(f"❌ 创建示例数据失败: {e}")
-        return False
+from core.lifecycle_manager import MemoryLifecycleManager, MemoryCategory, MemoryImportance
+from core.embedding_v2 import test_embedding_model
+from core.qdrant_storage import QdrantMemoryStorage
 
 
 def main():
-    """主函数 - Main function"""
+    """主函数"""
     parser = argparse.ArgumentParser(
-        description="ATLAS Memory Core - 零Token智能记忆系统",
+        description="ATLAS-MemoryCore V6.0 - 智能记忆系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  %(prog)s test                    # 测试系统连接
-  %(prog)s interactive             # 进入交互模式
-  %(prog)s create-sample           # 创建示例数据
-  %(prog)s --config ./config.yaml  # 使用指定配置文件
-        """,
+  %(prog)s capture "重要记忆文本" --category work --importance high
+  %(prog)s search "查询内容" --limit 5
+  %(prog)s optimize --force
+  %(prog)s stats
+        """
     )
-
-    parser.add_argument(
-        "command",
-        nargs="?",
-        choices=["test", "interactive", "create-sample", "help"],
-        default="interactive",
-        help="执行命令 (默认: interactive)",
-    )
-
-    parser.add_argument("--config", "-c", help="配置文件路径")
-
-    parser.add_argument(
-        "--log-level",
-        "-l",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="日志级别 (默认: INFO)",
-    )
-
-    parser.add_argument("--log-file", help="日志文件路径")
-
+    
+    subparsers = parser.add_subparsers(dest="command", help="命令")
+    
+    # capture命令
+    capture_parser = subparsers.add_parser("capture", help="捕获记忆")
+    capture_parser.add_argument("text", help="记忆文本")
+    capture_parser.add_argument("--category", choices=[c.value for c in MemoryCategory], 
+                               default="personal", help="记忆分类")
+    capture_parser.add_argument("--importance", choices=[i.value for i in MemoryImportance], 
+                               default="medium", help="重要性级别")
+    capture_parser.add_argument("--tags", nargs="+", help="标签列表")
+    
+    # search命令
+    search_parser = subparsers.add_parser("search", help="搜索记忆")
+    search_parser.add_argument("query", help="查询文本")
+    search_parser.add_argument("--limit", type=int, default=5, help="返回数量")
+    search_parser.add_argument("--category", choices=[c.value for c in MemoryCategory], 
+                              help="分类过滤")
+    search_parser.add_argument("--threshold", type=float, default=0.82, 
+                              help="相似度阈值")
+    
+    # optimize命令
+    optimize_parser = subparsers.add_parser("optimize", help="优化记忆")
+    optimize_parser.add_argument("--force", action="store_true", 
+                                help="强制优化（忽略时间间隔）")
+    
+    # stats命令
+    stats_parser = subparsers.add_parser("stats", help="显示统计信息")
+    
+    # test命令
+    test_parser = subparsers.add_parser("test", help="运行测试")
+    test_parser.add_argument("--embedding", action="store_true", help="测试嵌入模型")
+    test_parser.add_argument("--storage", action="store_true", help="测试存储")
+    test_parser.add_argument("--lifecycle", action="store_true", help="测试生命周期")
+    test_parser.add_argument("--all", action="store_true", help="运行所有测试")
+    
+    # backup命令
+    backup_parser = subparsers.add_parser("backup", help="备份数据")
+    backup_parser.add_argument("--dir", default="./backup", help="备份目录")
+    
+    # restore命令
+    restore_parser = subparsers.add_parser("restore", help="恢复数据")
+    restore_parser.add_argument("--dir", required=True, help="备份目录")
+    
     args = parser.parse_args()
-
-    # 设置日志
-    setup_logging(args.log_level, args.log_file)
-
-    # 显示欢迎信息
-    print("🏔️ ATLAS Memory Core v0.1.0")
-    print("=" * 50)
-
-    # 执行命令
-    if args.command == "test":
-        success = test_connection(args.config)
-        sys.exit(0 if success else 1)
-
-    elif args.command == "interactive":
-        interactive_mode(args.config)
-
-    elif args.command == "create-sample":
-        success = create_sample_data(args.config)
-        sys.exit(0 if success else 1)
-
-    elif args.command == "help":
+    
+    if not args.command:
         parser.print_help()
-
-    else:
-        print(f"未知命令: {args.command}")
-        parser.print_help()
+        return
+    
+    # 初始化管理器
+    manager = MemoryLifecycleManager()
+    
+    try:
+        if args.command == "capture":
+            handle_capture(manager, args)
+        elif args.command == "search":
+            handle_search(manager, args)
+        elif args.command == "optimize":
+            handle_optimize(manager, args)
+        elif args.command == "stats":
+            handle_stats(manager)
+        elif args.command == "test":
+            handle_test(args)
+        elif args.command == "backup":
+            handle_backup(manager, args)
+        elif args.command == "restore":
+            handle_restore(manager, args)
+            
+    except KeyboardInterrupt:
+        print("\n\n👋 操作已取消")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
         sys.exit(1)
+
+
+def handle_capture(manager: MemoryLifecycleManager, args):
+    """处理捕获命令"""
+    print(f"📝 捕获记忆...")
+    
+    # 解析参数
+    category = MemoryCategory(args.category)
+    importance = MemoryImportance(args.importance)
+    
+    # 捕获记忆
+    memory_id = manager.capture_memory(
+        text=args.text,
+        category=category,
+        importance=importance,
+        tags=args.tags
+    )
+    
+    print(f"✅ 记忆捕获成功!")
+    print(f"   ID: {memory_id}")
+    print(f"   分类: {category.value}")
+    print(f"   重要性: {importance.value}")
+    print(f"   标签: {args.tags or '无'}")
+
+
+def handle_search(manager: MemoryLifecycleManager, args):
+    """处理搜索命令"""
+    print(f"🔍 搜索记忆: '{args.query}'")
+    
+    # 解析参数
+    category = MemoryCategory(args.category) if args.category else None
+    
+    # 搜索记忆
+    memories = manager.retrieve_memories(
+        query=args.query,
+        limit=args.limit,
+        category=category,
+        similarity_threshold=args.threshold
+    )
+    
+    if not memories:
+        print("📭 未找到相关记忆")
+        return
+    
+    print(f"📚 找到{len(memories)}条相关记忆:")
+    
+    for i, memory in enumerate(memories):
+        print(f"\n{i+1}. {'⭐' * int(memory.score * 5)} 评分: {memory.score:.3f}")
+        print(f"   分类: {memory.metadata.category.value}")
+        print(f"   重要性: {memory.metadata.importance.value}")
+        print(f"   创建: {datetime.fromtimestamp(memory.metadata.created_at).strftime('%Y-%m-%d %H:%M')}")
+        print(f"   最后访问: {datetime.fromtimestamp(memory.metadata.last_accessed).strftime('%Y-%m-%d %H:%M')}")
+        print(f"   访问次数: {memory.metadata.access_count}")
+        print(f"   内容: {memory.text[:100]}..." if len(memory.text) > 100 else f"   内容: {memory.text}")
+        
+        if memory.metadata.tags:
+            print(f"   标签: {', '.join(memory.metadata.tags)}")
+
+
+def handle_optimize(manager: MemoryLifecycleManager, args):
+    """处理优化命令"""
+    print("🔄 开始记忆优化...")
+    
+    manager.optimize_memories(force=args.force)
+    
+    print("✅ 记忆优化完成")
+
+
+def handle_stats(manager: MemoryLifecycleManager):
+    """处理统计命令"""
+    print("📊 记忆系统统计信息:")
+    
+    stats = manager.get_statistics()
+    
+    # 存储统计
+    storage = stats["storage"]
+    if "error" in storage:
+        print(f"❌ 存储错误: {storage['error']}")
+    else:
+        print(f"\n💾 存储统计:")
+        print(f"  记忆总数: {storage.get('total_memories', 0)}")
+        print(f"  平均评分: {storage.get('average_score', 0):.3f}")
+        print(f"  向量数量: {storage.get('vectors_count', 0)}")
+        
+        if "categories" in storage:
+            print(f"  分类分布:")
+            for cat, count in storage["categories"].items():
+                print(f"    {cat}: {count}")
+        
+        if "importances" in storage:
+            print(f"  重要性分布:")
+            for imp, count in storage["importances"].items():
+                print(f"    {imp}: {count}")
+    
+    # 生命周期事件
+    events = stats["lifecycle_events"]
+    print(f"\n📈 生命周期事件:")
+    print(f"  事件总数: {events['total']}")
+    if "by_stage" in events:
+        print(f"  阶段分布:")
+        for stage, count in events["by_stage"].items():
+            print(f"    {stage}: {count}")
+    
+    # 嵌入模型信息
+    embedding = stats["embedding_model"]
+    print(f"\n🤖 嵌入模型:")
+    print(f"  模型类型: {embedding.get('model_type', 'unknown')}")
+    print(f"  向量维度: {embedding.get('vector_size', 0)}")
+    print(f"  缓存大小: {embedding.get('cache_size', 0)}")
+    
+    # 配置信息
+    config = stats["config"]
+    print(f"\n⚙️  系统配置:")
+    print(f"  升级阈值: {config.get('upgrade_threshold', 0.85)}")
+    print(f"  遗忘阈值: {config.get('forget_threshold', 0.3)}")
+    print(f"  最大年龄: {config.get('max_age_days', 7)}天")
+    print(f"  最后优化: {stats.get('last_optimization', '从未')}")
+
+
+def handle_test(args):
+    """处理测试命令"""
+    if args.all or args.embedding:
+        print("🧪 测试嵌入模型...")
+        test_embedding_model()
+    
+    if args.all or args.storage:
+        print("\n🧪 测试存储系统...")
+        test_storage()
+    
+    if args.all or args.lifecycle:
+        print("\n🧪 测试生命周期管理器...")
+        from core.lifecycle_manager import test_lifecycle_manager
+        test_lifecycle_manager()
+    
+    if not any([args.all, args.embedding, args.storage, args.lifecycle]):
+        print("请指定测试类型，或使用 --all 运行所有测试")
+
+
+def test_storage():
+    """测试存储系统"""
+    try:
+        storage = QdrantMemoryStorage()
+        
+        # 测试存储
+        print("📝 测试记忆存储...")
+        
+        # 创建测试向量
+        test_vector = [0.1] * 768
+        
+        memory_id = storage.store_memory(
+            text="测试记忆内容",
+            embedding=test_vector,
+            category=MemoryCategory.SYSTEM,
+            importance=MemoryImportance.MEDIUM,
+            tags=["test", "storage"]
+        )
+        
+        print(f"  存储成功，ID: {memory_id}")
+        
+        # 测试检索
+        print("🔍 测试记忆检索...")
+        memories = storage.search_memories(
+            query_embedding=test_vector,
+            limit=3
+        )
+        
+        print(f"  检索到{len(memories)}条记忆")
+        
+        # 测试统计
+        print("📊 测试统计信息...")
+        stats = storage.get_statistics()
+        print(f"  统计: {stats}")
+        
+        # 清理测试数据
+        storage.delete_memory(memory_id)
+        
+        print("✅ 存储系统测试完成")
+        
+    except Exception as e:
+        print(f"❌ 存储测试失败: {e}")
+
+
+def handle_backup(manager: MemoryLifecycleManager, args):
+    """处理备份命令"""
+    print(f"💾 备份数据到 {args.dir}...")
+    
+    manager.export_backup(args.dir)
+    
+    print("✅ 备份完成")
+
+
+def handle_restore(manager: MemoryLifecycleManager, args):
+    """处理恢复命令"""
+    print(f"📥 从 {args.dir} 恢复数据...")
+    
+    manager.import_backup(args.dir)
+    
+    print("✅ 恢复完成")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n👋 程序被用户中断")
-        sys.exit(0)
-    except Exception as e:
-        print(f"❌ 程序运行失败: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    main()

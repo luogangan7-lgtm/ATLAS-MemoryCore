@@ -61,6 +61,14 @@ class EmbeddingModel:
         """
         if self.model is None:
             raise RuntimeError("模型未初始化")
+        
+        # 输入验证
+        if not texts:
+            raise ValueError("输入文本列表不能为空")
+        
+        for text in texts:
+            if not text or not isinstance(text, str):
+                raise ValueError(f"无效的文本输入: {text}")
 
         try:
             # 批量编码
