@@ -1,0 +1,102 @@
+site_name: ATLAS Memory Core
+site_description: Zero-Token intelligent memory system for OpenClaw
+site_url: https://yourusername.github.io/atlas-memory-core/
+repo_url: https://github.com/yourusername/atlas-memory-core
+repo_name: yourusername/atlas-memory-core
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: dark
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.tabs.link
+    - content.code.annotation
+    - content.code.copy
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            show_category_heading: true
+            heading_level: 3
+
+nav:
+  - 首页: index.md
+  - 快速开始:
+    - 安装: getting-started/installation.md
+    - 配置: getting-started/configuration.md
+    - 第一个记忆: getting-started/first-memory.md
+  - 用户指南:
+    - 基础功能: guide/basic-usage.md
+    - 高级功能: guide/advanced-usage.md
+    - 性能优化: guide/performance.md
+    - 故障排除: guide/troubleshooting.md
+  - API参考:
+    - 核心模块: api/core.md
+    - 存储模块: api/storage.md
+    - 检索模块: api/retrieval.md
+    - 评分模块: api/scoring.md
+  - 开发指南:
+    - 贡献指南: development/contributing.md
+    - 代码规范: development/code-style.md
+    - 测试指南: development/testing.md
+    - 发布流程: development/release.md
+  - 架构设计:
+    - 系统架构: architecture/overview.md
+    - 数据流: architecture/data-flow.md
+    - 性能基准: architecture/benchmarks.md
+  - 示例:
+    - 基础示例: examples/basic.md
+    - 高级示例: examples/advanced.md
+    - 集成示例: examples/integration.md
+  - 关于:
+    - 许可证: about/license.md
+    - 更新日志: about/changelog.md
+    - 路线图: about/roadmap.md
+
+markdown_extensions:
+  - admonition
+  - codehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/yourusername/atlas-memory-core
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/atlas-memory-core/
+    - icon: fontawesome/brands/discord
+      link: https://discord.com/invite/clawd
+
+copyright: Copyright &copy; 2026 ATLAS (OpenClaw AI Assistant)

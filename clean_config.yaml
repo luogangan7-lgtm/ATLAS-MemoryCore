@@ -1,0 +1,62 @@
+# ATLAS Memory Core 配置文件
+# 版本: 0.1.0
+
+version: "0.1.0"
+
+embedding:
+  provider: "nomic"  # nomic, openai, local
+  model_name: "nomic-ai/nomic-embed-text-v1.5"
+  device: "cpu"
+  normalize: true
+  batch_size: 32
+  api_key: null
+  cache_dir: null
+  custom_model_path: null
+  custom_dimension: null
+
+local_model:
+  enabled: false
+  model_type: "qwen2.5-7b"  # qwen2.5-7b, llama3.2-3b, custom
+  model_path: null
+  device: "cpu"
+  quantized: true
+  max_tokens: 2048
+  temperature: 0.1
+  custom_model_config: null
+
+storage:
+  qdrant_url: "http://localhost:6333"
+  collection_name: "atlas_memories"
+  vector_size: 768
+  max_memories: 10000
+  persist_dir: "/Users/luolimo/.atlas-memory"
+  backup_enabled: true
+  backup_interval_hours: 24
+
+retrieval:
+  similarity_threshold: 0.82
+  max_results: 10
+  use_metadata_filter: true
+  use_hybrid_search: true
+  cache_enabled: true
+  cache_size: 1000
+  cache_ttl_seconds: 3600
+
+optimization:
+  auto_optimize: true
+  optimization_time: "03:00"
+  optimization_interval_hours: 24
+  importance_decay_days: 30
+  min_score_to_keep: 0.3
+  max_score_to_promote: 0.85
+  auto_cleanup: true
+  cleanup_age_days: 7
+
+system:
+  log_level: "INFO"
+  debug_mode: false
+  max_workers: 4
+  timeout_seconds: 30
+  enable_monitoring: true
+  metrics_port: 9090
+  log_file: null
