@@ -1,86 +1,54 @@
-# ATLAS-MemoryCore V6.0 Docker容器化部署
-# Phase 2: 生产环境部署
+# ATLAS-MemoryCore V6.2 Docker镜像
+# ATLAS-MemoryCore V6.2 Docker Image
+# 基于Python 3.12的轻量级镜像
+# Lightweight image based on Python 3.12
 
-FROM python:3.11-slim as builder
+FROM python:3.12-slim
+
+# 设置工作目录
+# Set working directory
+WORKDIR /app
+
+# 设置环境变量
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src
 
 # 安装系统依赖
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
-    make \
     curl \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
-# 设置工作目录
-WORKDIR /app
-
-# 复制项目文件
-COPY . .
-
-# 创建虚拟环境并安装依赖
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# 复制依赖文件
+# Copy dependency files
+COPY requirements.txt .
 
 # 安装Python依赖
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
-
-# 安装Qdrant客户端
-RUN pip install qdrant-client
-
-# 安装可选依赖（情感分析）
-RUN pip install textblob
-
-# 安装开发依赖（可选）
-RUN pip install pytest pytest-cov black isort
-
-# 第二阶段：运行环境
-FROM python:3.11-slim
-
-# 安装运行时依赖
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# 从builder复制虚拟环境
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# 创建非root用户
-RUN useradd -m -u 1000 atlas && \
-    chown -R atlas:atlas /app
-
-# 设置工作目录
-WORKDIR /app
-USER atlas
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制项目文件
-COPY --chown=atlas:atlas . .
+# Copy project files
+COPY . .
 
 # 创建必要的目录
-RUN mkdir -p data/qdrant_storage data/logs data/backups
-
-# 环境变量
-ENV PYTHONPATH=/app
-ENV QDRANT_HOST=localhost
-ENV QDRANT_PORT=6333
-ENV QDRANT_STORAGE_PATH=/app/data/qdrant_storage
-ENV LOG_LEVEL=INFO
-ENV MODEL_CACHE_DIR=/app/data/models
+# Create necessary directories
+RUN mkdir -p /app/data /app/logs /app/config
 
 # 健康检查
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sys; sys.path.append('/app'); from src.core.qdrant_storage import QdrantStorage; storage = QdrantStorage(); print('Health check passed') if storage.client else exit(1)"
+    CMD python -c "import sys; sys.path.append('/app/src'); from core.aegis_orchestrator import get_global_orchestrator; orchestrator = get_global_orchestrator(); print('Health check passed')" || exit 1
 
 # 暴露端口
-EXPOSE 6333 8000
+# Expose ports
+EXPOSE 8000  # API端口 / API port
+EXPOSE 9091  # 监控指标端口 / Metrics port
 
-# 默认命令：启动Qdrant和ATLAS服务
-COPY --chown=atlas:atlas docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
-
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
-
-# 备用命令：直接运行Python模块
-CMD ["python", "-m", "src", "serve", "--host", "0.0.0.0", "--port", "8000"]
+# 设置默认命令
+# Set default command
+CMD ["python", "src/api/server.py"]
