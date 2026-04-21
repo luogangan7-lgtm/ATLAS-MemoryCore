@@ -24,7 +24,6 @@ prediction_target.mkdir(exist_ok=True)
 
 files = [
     ("prediction_engine.py", "预测引擎"),
-    ("qian_xuesen_knowledge.py", "钱学森知识库"),
     ("__init__.py", "初始化")
 ]
 
@@ -46,7 +45,6 @@ integration_code = '''"""
 
 try:
     from .prediction_engine import PredictionEngine
-    from .qian_xuesen_knowledge import QianXuesenKnowledge
     AVAILABLE = True
 except ImportError:
     AVAILABLE = False
