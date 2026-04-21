@@ -9,5 +9,5 @@ from .token_optimizer import TokenOptimizer
 
 __all__ = [
     "SelfOptimizationLoop",
-    "TokenOptimizer", 
+    "TokenOptimizer",
 ]
