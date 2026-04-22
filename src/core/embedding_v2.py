@@ -66,9 +66,12 @@ class EnhancedEmbeddingModel:
         try:
             if self.config.model_type == EmbeddingModelType.NOMIC and NOMIC_AVAILABLE:
                 self._init_nomic_model()
-                self.model_type = EmbeddingModelType.NOMIC
-                print(f"✅ 使用Nomic嵌入模型: {self.config.model_name}")
-                
+                # _init_nomic_model may have already set a fallback model_type;
+                # only assign NOMIC here if it didn't (i.e. still None)
+                if self.model_type is None:
+                    self.model_type = EmbeddingModelType.NOMIC
+                    print(f"✅ 使用Nomic嵌入模型: {self.config.model_name}")
+
             elif SENTENCE_TRANSFORMERS_AVAILABLE:
                 self._init_sentence_transformers()
                 self.model_type = EmbeddingModelType.SENTENCE_TRANSFORMERS
@@ -150,36 +153,33 @@ class EnhancedEmbeddingModel:
             oldest_key = self.cache_order.pop(0)
             del self.cache[oldest_key]
     
-    def encode_single(self, text: str) -> List[float]:
+    def encode_single(self, text: str, task: str = "document") -> List[float]:
         """
-        编码单个文本
-        
+        编码单个文本。
+
         Args:
             text: 输入文本
-            
+            task: "document"（存储）或 "query"（检索）。
+                  nomic 模型会自动添加 search_document:/search_query: 前缀。
+
         Returns:
             嵌入向量
         """
-        # 输入验证
         if not text or not isinstance(text, str):
             raise ValueError(f"无效的文本输入: {text}")
-        
-        # 检查缓存
-        cache_key = self._get_cache_key(text)
+
+        cache_key = self._get_cache_key(f"{task}:{text}")
         if cache_key in self.cache:
             return self.cache[cache_key]
-        
-        # 根据模型类型编码
+
         if self.model_type == EmbeddingModelType.NOMIC:
-            embedding = self._encode_with_nomic([text])[0]
+            embedding = self._encode_with_nomic([text], task=task)[0]
         elif self.model_type == EmbeddingModelType.SENTENCE_TRANSFORMERS:
-            embedding = self._encode_with_sentence_transformers([text])[0]
+            embedding = self._encode_with_sentence_transformers([text], task=task)[0]
         else:
             embedding = self._encode_with_fallback([text])[0]
-        
-        # 更新缓存
+
         self._update_cache(cache_key, embedding)
-        
         return embedding
     
     def encode_batch(self, texts: List[str]) -> List[List[float]]:
@@ -284,11 +284,16 @@ class EnhancedEmbeddingModel:
             else:
                 return self._encode_with_fallback(texts)
     
-    def _encode_with_sentence_transformers(self, texts: List[str]) -> List[List[float]]:
-        """使用Sentence Transformers编码"""
+    def _encode_with_sentence_transformers(self, texts: List[str], task: str = "document") -> List[List[float]]:
+        """使用Sentence Transformers编码（nomic 模型自动添加任务前缀）"""
         try:
+            encode_texts = texts
+            if "nomic" in self.config.model_name.lower():
+                prefix = "search_query: " if task == "query" else "search_document: "
+                encode_texts = [prefix + t for t in texts]
+
             embeddings = self.model.encode(
-                texts,
+                encode_texts,
                 batch_size=self.config.batch_size,
                 normalize_embeddings=self.config.normalize_embeddings,
                 show_progress_bar=False

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 from .qdrant_storage import QdrantMemoryStorage, MemoryCategory, MemoryImportance, MemoryRecord
 from .embedding_v2 import EnhancedEmbeddingModel, get_embedding_model
+from qdrant_client.http import models as qdrant_models
 
 
 class MemoryLifecycleStage(Enum):
@@ -283,16 +284,17 @@ class MemoryLifecycleManager:
     负责记忆的创建、评分、升级、遗忘全周期管理
     """
     
-    def __init__(self, storage_path: str = None, qmd_path: str = None):
+    def __init__(self, storage_path: str = None, url: str = None, qmd_path: str = None):
         """
         初始化生命周期管理器
-        
+
         Args:
-            storage_path: Qdrant存储路径
+            storage_path: Qdrant本地文件存储路径
+            url: Qdrant HTTP服务地址，如 http://localhost:6333
             qmd_path: QMD文件路径
         """
         # 初始化组件
-        self.storage = QdrantMemoryStorage(storage_path=storage_path)
+        self.storage = QdrantMemoryStorage(storage_path=storage_path, url=url)
         self.embedding_model = get_embedding_model()
         self.scoring_engine = EnhancedScoringEngine()
         
@@ -312,51 +314,95 @@ class MemoryLifecycleManager:
             "last_optimization": 0
         }
     
-    def capture_memory(self, text: str, category: MemoryCategory, 
+    def capture_memory(self, text: str, category: MemoryCategory,
                       importance: MemoryImportance, tags: List[str] = None) -> str:
         """
-        捕获记忆 - 零Token捕获层入口
-        
-        Args:
-            text: 记忆文本
-            category: 记忆分类
-            importance: 重要性级别
-            tags: 标签列表
-            
+        捕获记忆 — Mem0 式 ADD/UPDATE/NOOP 三路决策：
+          cosine > 0.92 → UPDATE（更新文本和元数据，复用 ID）
+          0.65–0.92   → ADD（相关但不重复，保留两者）
+          < 0.65      → ADD（全新记忆）
+
         Returns:
-            记忆ID
+            记忆ID（新建或复用的）
         """
-        # 1. 生成嵌入向量（零Token成本）
-        embedding = self.embedding_model.encode_single(text)
-        
-        # 2. 存储到Qdrant
-        memory_id = self.storage.store_memory(
-            text=text,
-            embedding=embedding,
-            category=category,
-            importance=importance,
-            tags=tags or []
-        )
-        
-        # 3. 记录生命周期事件
+        embedding = self.embedding_model.encode_single(text, task="document")
+
+        # 去重检查：在同类别内找相似度最高的现有记忆
+        existing_id, cosine_sim = self._find_most_similar(embedding, category)
+
+        if existing_id and cosine_sim > 0.92:
+            # UPDATE — 内容近乎相同，覆盖旧记忆
+            memory_id = self.storage.update_memory(
+                memory_id=existing_id,
+                text=text,
+                embedding=embedding,
+                importance=importance,
+                tags=tags or [],
+            )
+            action = "UPDATE"
+        else:
+            # ADD — 新记忆或仅相关记忆
+            memory_id = self.storage.store_memory(
+                text=text,
+                embedding=embedding,
+                category=category,
+                importance=importance,
+                tags=tags or [],
+            )
+            action = "ADD"
+
         self._record_lifecycle_event(
             memory_id=memory_id,
             stage=MemoryLifecycleStage.CREATED,
             metadata={
+                "action": action,
                 "text_length": len(text),
                 "category": category.value,
                 "importance": importance.value,
-                "tags": tags or []
-            }
+                "tags": tags or [],
+                "dedup_cosine": round(cosine_sim, 3) if cosine_sim else None,
+            },
         )
-        
-        print(f"📝 记忆捕获完成: ID={memory_id[:8]}, 分类={category.value}, 重要性={importance.value}")
-        
+
+        print(f"📝 记忆捕获完成: ID={memory_id[:8]}, 分类={category.value}, 重要性={importance.value}, 操作={action}")
         return memory_id
+
+    def _find_most_similar(self, embedding: List[float], category: MemoryCategory,
+                           top_k: int = 3) -> tuple:
+        """
+        在同类别内检索最相似的现有记忆（低阈值 0.50，候选池小）。
+        Returns: (memory_id | None, cosine_similarity | 0.0)
+        """
+        try:
+            candidates = self.storage.search_memories(
+                query_embedding=embedding,
+                limit=top_k,
+                category=category,
+                similarity_threshold=0.50,
+            )
+            if not candidates:
+                return None, 0.0
+            # search_memories 已按 Ebbinghaus 强度排序，但我们需要按余弦相似度判断去重
+            # 直接用 Qdrant 原始分：用低阈值 query_points 单独查
+            raw = self.storage.client.query_points(
+                collection_name=self.storage.collection_name,
+                query=embedding,
+                query_filter=None,
+                limit=1,
+                score_threshold=0.50,
+                with_payload=False,
+                with_vectors=False,
+            )
+            pts = raw.points if hasattr(raw, 'points') else raw
+            if pts:
+                return str(pts[0].id), pts[0].score
+        except Exception:
+            pass
+        return None, 0.0
     
-    def retrieve_memories(self, query: str, limit: int = 5, 
+    def retrieve_memories(self, query: str, limit: int = 5,
                          category: Optional[MemoryCategory] = None,
-                         similarity_threshold: float = 0.82) -> List[MemoryRecord]:
+                         similarity_threshold: float = 0.65) -> List[MemoryRecord]:
         """
         检索记忆 - 惰性检索引擎
         
@@ -370,7 +416,7 @@ class MemoryLifecycleManager:
             记忆记录列表
         """
         # 1. 生成查询嵌入
-        query_embedding = self.embedding_model.encode_single(query)
+        query_embedding = self.embedding_model.encode_single(query, task="query")
         
         # 2. 从Qdrant搜索
         memories = self.storage.search_memories(
@@ -455,8 +501,8 @@ class MemoryLifecycleManager:
         
         # 获取低评分记忆
         low_score_memories = self.storage.get_low_score_memories(
-            threshold=threshold,
-            max_age_days=max_age_days
+            strength_threshold=threshold,
+            min_age_days=max_age_days,
         )
         
         print(f"🗑️  找到{len(low_score_memories)}条低价值记忆（评分<{threshold}, 年龄>{max_age_days}天）")
@@ -578,7 +624,7 @@ class MemoryLifecycleManager:
                 # 更新到Qdrant
                 self.storage.client.upsert(
                     collection_name=self.storage.collection_name,
-                    points=[self.storage.client.http.models.PointStruct(
+                    points=[qdrant_models.PointStruct(
                         id=point.id,
                         vector=point.vector,
                         payload=payload

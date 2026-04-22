@@ -195,7 +195,7 @@ class AegisOrchestrator:
             else:
                 # 回退到简单检索
                 retrieved = context.qdrant_storage.search_memories(
-                    query_vector=context.query_embedding,
+                    query_embedding=context.query_embedding,
                     limit=10
                 )
                 context.retrieved_memories = retrieved
@@ -284,9 +284,9 @@ class AegisOrchestrator:
         
         for i, memory in enumerate(memories[:10]):  # 最多10条记忆
             # 提取记忆内容
-            content = memory.content or ""
-            importance = memory.importance_score or 0.0
-            category = memory.metadata.get("category", "unknown") if memory.metadata else "unknown"
+            content = memory.text or ""
+            importance = memory.score or 0.0
+            category = memory.metadata.category.value if memory.metadata else "unknown"
             
             # 格式化记忆条目
             memory_text = f"[记忆{i+1}: {category}, 重要性{importance:.2f}]\n{content}\n"

@@ -4,6 +4,7 @@ Qdrant存储模块 - 零Token捕获层的核心实现
 """
 
 import json
+import math
 import time
 import hashlib
 from typing import Dict, List, Optional, Any, Union
@@ -13,7 +14,10 @@ import numpy as np
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from qdrant_client.http.models import Distance, VectorParams
+from qdrant_client.http.models import (
+    Distance, VectorParams, HnswConfigDiff,
+    ScalarQuantization, ScalarQuantizationConfig, ScalarType,
+)
 
 
 class MemoryCategory(Enum):
@@ -113,23 +117,27 @@ class MemoryRecord:
 class QdrantMemoryStorage:
     """Qdrant记忆存储 - 零Token捕获层核心"""
     
-    def __init__(self, collection_name: str = "atlas_memories", 
+    def __init__(self, collection_name: str = "atlas_memories",
                  vector_size: int = 768,  # nomic-embed-text-v1.5维度
-                 storage_path: str = None):
+                 storage_path: str = None,
+                 url: str = None):
         """
         初始化Qdrant存储
-        
+
         Args:
             collection_name: 集合名称
             vector_size: 向量维度
-            storage_path: 存储路径，None表示内存模式
+            storage_path: 本地文件存储路径
+            url: Qdrant HTTP服务地址，如 http://localhost:6333
         """
         self.collection_name = collection_name
         self.vector_size = vector_size
-        
+
         # 初始化Qdrant客户端
         try:
-            if storage_path:
+            if url:
+                self.client = QdrantClient(url=url)
+            elif storage_path:
                 self.client = QdrantClient(path=storage_path)
             else:
                 self.client = QdrantClient(":memory:")
@@ -151,8 +159,29 @@ class QdrantMemoryStorage:
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(
                     size=self.vector_size,
-                    distance=Distance.COSINE
-                )
+                    distance=Distance.COSINE,
+                    # HNSW: m=16 平衡内存与召回率，ef_construct=100 保证索引质量
+                    hnsw_config=HnswConfigDiff(m=16, ef_construct=100),
+                ),
+                # INT8 标量量化：~4x 内存压缩，rescore 恢复精度
+                quantization_config=ScalarQuantizationConfig(
+                    scalar=ScalarQuantization(
+                        type=ScalarType.INT8,
+                        quantile=0.99,
+                        always_ram=True,
+                    )
+                ),
+            )
+            # 创建 payload 索引，加速分类过滤
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="metadata.category",
+                field_schema="keyword",
+            )
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="metadata.importance",
+                field_schema="keyword",
             )
     
     def _generate_id(self, text: str, metadata: MemoryMetadata) -> str:
@@ -208,120 +237,138 @@ class QdrantMemoryStorage:
         
         return memory_id
     
+    # 重要性等级 → 数值映射（用于 Ebbinghaus 公式）
+    _IMPORTANCE_VALUES = {
+        MemoryImportance.LOW: 0.2,
+        MemoryImportance.MEDIUM: 0.5,
+        MemoryImportance.HIGH: 0.8,
+        MemoryImportance.CRITICAL: 1.0,
+    }
+
+    @staticmethod
+    def _memory_strength(importance_value: float, days_since_access: float, recall_count: int) -> float:
+        """
+        Ebbinghaus 遗忘曲线衰减强度（2025 最佳实践）：
+          strength = importance × e^(−λ_eff × days) × access_boost
+          λ_eff = 0.16 × (1 − importance × 0.8)
+
+        重要性与半衰期对应关系：
+          critical(1.0) → λ=0.032 → ~6个月
+          high(0.8)     → λ=0.054 → ~3周
+          medium(0.5)   → λ=0.096 → ~7天
+          low(0.2)      → λ=0.144 → ~5天
+        """
+        λ_eff = 0.16 * (1.0 - importance_value * 0.8)
+        decay = math.exp(-λ_eff * max(0.0, days_since_access))
+        access_boost = 1.0 + min(recall_count * 0.2, 4.0)   # 最大 5x 加成
+        return min(1.0, max(0.0, importance_value * decay * access_boost))
+
     def _calculate_initial_score(self, importance: MemoryImportance) -> float:
-        """计算初始评分"""
-        importance_map = {
-            MemoryImportance.LOW: 0.3,
-            MemoryImportance.MEDIUM: 0.5,
-            MemoryImportance.HIGH: 0.7,
-            MemoryImportance.CRITICAL: 0.9
-        }
-        return importance_map.get(importance, 0.5)
+        """新记忆初始强度（刚创建，days_since_access=0，recall_count=0）"""
+        iv = self._IMPORTANCE_VALUES.get(importance, 0.5)
+        return self._memory_strength(iv, 0.0, 0)
     
-    def search_memories(self, query_embedding: List[float], 
+    def search_memories(self, query_embedding: List[float],
                        limit: int = 10,
                        category: Optional[MemoryCategory] = None,
                        min_score: float = 0.0,
-                       similarity_threshold: float = 0.82) -> List[MemoryRecord]:
+                       similarity_threshold: float = 0.65) -> List[MemoryRecord]:
         """
-        搜索记忆 - 惰性检索引擎
-        
+        搜索记忆：两阶段管道
+          Stage 1 — Qdrant 向量检索（余弦相似度 ≥ similarity_threshold），多取 limit*4 候选
+          Stage 2 — Python 端用 Ebbinghaus 强度重排，返回最终 top-N
+
         Args:
-            query_embedding: 查询向量
-            limit: 返回数量限制
+            query_embedding: 查询向量（L2 归一化）
+            limit: 最终返回数量
             category: 分类过滤
-            min_score: 最小评分阈值
-            similarity_threshold: 相似度阈值
-            
-        Returns:
-            记忆记录列表
+            min_score: 最小 Ebbinghaus 强度阈值（pruning_threshold=0.05）
+            similarity_threshold: 余弦相似度下限（nomic-embed-text-v1.5 建议 0.65-0.70）
         """
-        # 构建过滤器
         filter_condition = None
         if category:
-            filter_condition = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="metadata.category",
-                        match=models.MatchValue(value=category.value)
-                    )
-                ]
-            )
-        
-        # 执行搜索 - 使用query_points方法
+            filter_condition = models.Filter(must=[
+                models.FieldCondition(
+                    key="metadata.category",
+                    match=models.MatchValue(value=category.value),
+                )
+            ])
+
+        # Stage 1: 多取候选（limit*4，最少 20）供重排
+        candidate_limit = max(20, limit * 4)
         search_result = self.client.query_points(
             collection_name=self.collection_name,
             query=query_embedding,
             query_filter=filter_condition,
-            limit=limit * 2,  # 多取一些用于过滤
+            limit=candidate_limit,
             score_threshold=similarity_threshold,
             with_payload=True,
-            with_vectors=True
+            with_vectors=True,
+            search_params=models.SearchParams(
+                hnsw_ef=128,       # 查询时提高精度
+                exact=False,
+            ),
         )
-        
-        # 过滤和排序
+
+        scored_points = search_result.points if hasattr(search_result, 'points') else search_result
+        now = time.time()
+
+        # Stage 2: 计算 Ebbinghaus 强度并重排
+        candidates = []
+        for sp in scored_points:
+            record = MemoryRecord.from_qdrant_point(sp)
+            md = record.metadata
+            iv = self._IMPORTANCE_VALUES.get(md.importance, 0.5)
+            days_since = (now - md.last_accessed) / 86400.0
+            strength = self._memory_strength(iv, days_since, md.access_count)
+            if strength >= max(min_score, 0.05):   # 剪枝：强度 < 0.05 直接丢弃
+                candidates.append((strength, record))
+
+        # 按强度降序，取 top-N
+        candidates.sort(key=lambda x: x[0], reverse=True)
         memories = []
-        if hasattr(search_result, 'points'):
-            scored_points = search_result.points
-        else:
-            scored_points = search_result
-        
-        for scored_point in scored_points:
-            record = MemoryRecord.from_qdrant_point(scored_point)
-            
-            # 应用评分阈值
-            if record.score >= min_score:
-                # 更新访问信息
-                self._update_access_info(record.id)
-                memories.append(record)
-            
-            if len(memories) >= limit:
-                break
-        
+        for strength, record in candidates[:limit]:
+            record.score = strength           # 用真实 Ebbinghaus 分覆盖 payload 分
+            self._update_access_info(record.id)
+            memories.append(record)
+
         return memories
     
     def _update_access_info(self, memory_id: str):
-        """更新访问信息"""
+        """访问后：重置衰减时钟并重算 Ebbinghaus 强度"""
         try:
-            # 获取当前记录
             points = self.client.retrieve(
                 collection_name=self.collection_name,
-                ids=[memory_id]
+                ids=[memory_id],
+                with_vectors=True,
             )
-            
-            if points:
-                point = points[0]
-                payload = point.payload
-                metadata_dict = payload["metadata"]
-                
-                # 更新访问信息
-                metadata_dict["last_accessed"] = time.time()
-                metadata_dict["access_count"] = metadata_dict.get("access_count", 0) + 1
-                
-                # 更新评分（基于访问频率）
-                new_score = self._update_score_based_on_access(
-                    payload.get("score", 0.5),
-                    metadata_dict["access_count"]
-                )
-                payload["score"] = new_score
-                
-                # 更新到Qdrant
-                self.client.upsert(
-                    collection_name=self.collection_name,
-                    points=[models.PointStruct(
-                        id=point.id,
-                        vector=point.vector,
-                        payload=payload
-                    )]
-                )
+            if not points:
+                return
+            point = points[0]
+            payload = point.payload
+            metadata_dict = payload["metadata"]
+
+            now = time.time()
+            metadata_dict["last_accessed"] = now
+            recall_count = metadata_dict.get("access_count", 0) + 1
+            metadata_dict["access_count"] = recall_count
+
+            # 重算 Ebbinghaus 强度（访问重置衰减时钟：days_since_access=0）
+            importance_str = metadata_dict.get("importance", "medium")
+            importance_enum = MemoryImportance(importance_str)
+            iv = self._IMPORTANCE_VALUES.get(importance_enum, 0.5)
+            payload["score"] = self._memory_strength(iv, 0.0, recall_count)
+
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=[models.PointStruct(
+                    id=point.id,
+                    vector=point.vector,
+                    payload=payload,
+                )],
+            )
         except Exception as e:
             print(f"更新访问信息失败: {e}")
-    
-    def _update_score_based_on_access(self, current_score: float, access_count: int) -> float:
-        """基于访问次数更新评分"""
-        # 访问次数越多，评分越高，但有上限
-        boost = min(0.2, access_count * 0.02)
-        return min(1.0, current_score + boost)
     
     def get_memory_by_id(self, memory_id: str) -> Optional[MemoryRecord]:
         """根据ID获取记忆"""
@@ -357,44 +404,95 @@ class QdrantMemoryStorage:
             print(f"删除记忆失败: {e}")
             return False
     
-    def get_low_score_memories(self, threshold: float = 0.3, 
-                              max_age_days: float = 7) -> List[MemoryRecord]:
-        """获取低评分记忆（用于自动遗忘）"""
+    def update_memory(self, memory_id: str, text: str, embedding: List[float],
+                      importance: MemoryImportance, tags: List[str] = None) -> str:
+        """
+        更新现有记忆（Mem0 UPDATE 路径）：覆盖文本、向量、重要性和标签，
+        保留原始 created_at，重置 last_accessed（Ebbinghaus 时钟归零）。
+        若记忆不存在则降级为 store_memory。
+        """
+        points = self.client.retrieve(
+            collection_name=self.collection_name,
+            ids=[memory_id],
+            with_vectors=True,
+        )
+        if not points:
+            return self.store_memory(
+                text=text, embedding=embedding,
+                category=MemoryCategory.PERSONAL,
+                importance=importance, tags=tags,
+            )
+
+        point = points[0]
+        payload = dict(point.payload)
+        metadata = dict(payload.get("metadata", {}))
+
         now = time.time()
-        max_age_seconds = max_age_days * 24 * 3600
-        
-        # 搜索所有记忆
+        recall_count = metadata.get("access_count", 0) + 1
+        metadata["last_accessed"] = now
+        metadata["access_count"] = recall_count
+        metadata["importance"] = importance.value
+        metadata["tags"] = tags or []
+
+        iv = self._IMPORTANCE_VALUES.get(importance, 0.5)
+        payload["text"] = text
+        payload["metadata"] = metadata
+        payload["score"] = self._memory_strength(iv, 0.0, recall_count)
+
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=[models.PointStruct(
+                id=point.id,
+                vector=embedding,
+                payload=payload,
+            )],
+        )
+        return memory_id
+
+    def get_low_score_memories(self, strength_threshold: float = 0.05,
+                              min_age_days: float = 1.0) -> List[MemoryRecord]:
+        """
+        返回 Ebbinghaus 强度低于阈值的记忆（用于自动遗忘）。
+        默认强度阈值 0.05（研究建议的剪枝点）。
+        min_age_days 避免刚创建的记忆被误删。
+        """
+        now = time.time()
+        min_age_seconds = min_age_days * 86400.0
+
         all_points = self.client.scroll(
             collection_name=self.collection_name,
-            limit=1000
+            limit=1000,
+            with_payload=True,
+            with_vectors=False,
         )[0]
-        
+
         low_score_memories = []
         for point in all_points:
             payload = point.payload
             metadata = payload.get("metadata", {})
-            score = payload.get("score", 0.5)
             created_at = metadata.get("created_at", now)
-            last_accessed = metadata.get("last_accessed", now)
-            
-            # 检查条件：低评分 + 长时间未访问
-            age = now - created_at
-            last_access_age = now - last_accessed
-            
-            if (score < threshold and 
-                age > max_age_seconds and 
-                last_access_age > max_age_seconds):
-                
+
+            if (now - created_at) < min_age_seconds:
+                continue   # 太新，跳过
+
+            importance_str = metadata.get("importance", "medium")
+            try:
+                iv = self._IMPORTANCE_VALUES.get(MemoryImportance(importance_str), 0.5)
+            except ValueError:
+                iv = 0.5
+
+            last_accessed = metadata.get("last_accessed", created_at)
+            recall_count = metadata.get("access_count", 0)
+            days_since = (now - last_accessed) / 86400.0
+            strength = self._memory_strength(iv, days_since, recall_count)
+
+            if strength < strength_threshold:
                 scored_point = models.ScoredPoint(
-                    id=point.id,
-                    version=0,
-                    score=score,
-                    payload=payload,
-                    vector=point.vector
+                    id=point.id, version=0,
+                    score=strength, payload=payload, vector=None,
                 )
-                record = MemoryRecord.from_qdrant_point(scored_point)
-                low_score_memories.append(record)
-        
+                low_score_memories.append(MemoryRecord.from_qdrant_point(scored_point))
+
         return low_score_memories
     
     def get_high_score_memories(self, threshold: float = 0.85) -> List[MemoryRecord]:
@@ -458,8 +556,8 @@ class QdrantMemoryStorage:
                 "average_score": round(avg_score, 3),
                 "categories": categories,
                 "importances": importances,
-                "collection_status": collection_info.status,
-                "vectors_count": collection_info.vectors_count
+                "collection_status": str(collection_info.status),
+                "vectors_count": collection_info.points_count or 0
             }
         except Exception as e:
             return {"error": str(e)}
