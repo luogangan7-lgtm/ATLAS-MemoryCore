@@ -20,7 +20,7 @@ if ATLAS_CORE_SRC not in sys.path:
 
 # QMD 二进制路径
 QMD_BIN = "/Users/luolimo/.bun/install/cache/@GH@tobi-qmd-cfd640e@@@1/bin/qmd"
-QMD_COLLECTION = "workspace-memory"
+QMD_COLLECTION = "memory-dir-main"
 
 # oMLX 配置（本地 Qwen3.5-9B-OptiQ-4bit）
 OMLX_URL = "http://127.0.0.1:7749/v1/chat/completions"
