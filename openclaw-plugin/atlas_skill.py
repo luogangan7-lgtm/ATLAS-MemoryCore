@@ -121,7 +121,8 @@ def _compress_via_omlx(text: str, ratio: float = 0.3) -> str:
         "messages": messages,
         "max_tokens": max(200, target_len * 2),
         "temperature": 0.3,
-        "stream": False
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False}
     }).encode()
     req = _urlreq.Request(OMLX_URL, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -151,10 +152,11 @@ def _search_qmd(query: str, limit: int = 3) -> list:
         items = data if isinstance(data, list) else data.get("results", [])
         results = []
         for item in items[:limit]:
+            file_path = item.get("file", item.get("path", ""))
             results.append({
                 "source": "qmd",
-                "path": item.get("path", ""),
-                "title": item.get("title", item.get("path", "").split("/")[-1]),
+                "path": file_path,
+                "title": item.get("title", file_path.split("/")[-1]),
                 "snippet": item.get("snippet", item.get("text", ""))[:200],
                 "score": item.get("score", 0),
             })

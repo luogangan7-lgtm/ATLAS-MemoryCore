@@ -292,20 +292,21 @@ export function register(api) {
   // ── after_agent_turn：自动捕获对话写入 Qdrant ────────────────────────────
 
   api.registerHook(
-    'after_agent_turn',
+    'before_agent_reply',
     async (event) => {
       if (!_serverReady) return;
       try {
-        const { assistantMessage } = event || {};
-        if (!assistantMessage || typeof assistantMessage !== 'string') return;
-        if (assistantMessage.trim().length < 100) return;
+        // before_agent_reply event 包含即将发出的 reply 内容
+        const reply = event?.reply ?? event?.message ?? event?.assistantMessage ?? '';
+        if (!reply || typeof reply !== 'string') return;
+        if (reply.trim().length < 100) return;
 
-        // 静默写入，不等待结果
-        _callServer('auto_capture', [assistantMessage.slice(0, 800)]).catch(() => {});
+        // 静默写入，不等待结果，不阻塞回复
+        _callServer('auto_capture', [reply.slice(0, 800)]).catch(() => {});
       } catch (_e) {
         // 严格静默，任何错误都不影响主流程
       }
     },
-    { name: 'atlas-memory-auto-capture', description: '每轮对话后自动捕获重要内容到 Qdrant' }
+    { name: 'atlas-memory-auto-capture', description: '每轮回复前静默捕获重要内容到 Qdrant' }
   );
 }
