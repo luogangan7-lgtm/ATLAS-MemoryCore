@@ -88,6 +88,8 @@ async function callSkill(cmd, args = []) {
     const result = await _callServer(cmd, args);
     if (!result.error) return result;
   }
+  // Server not ready yet — return error instead of spawnSync (which blocks event loop)
+  if (!_serverReady) return { error: 'atlas-memory server not ready, retry in a moment' };
   return _callSubprocess(cmd, args);
 }
 
