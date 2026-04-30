@@ -1,6 +1,7 @@
 /**
- * ATLAS Memory Core — OpenClaw Plugin (plugin-system version, /Volumes/data)
- * Uses factory-format registerTool. No async default export (would break plugin loader).
+ * ATLAS Memory Core v7.0.0 — OpenClaw Plugin
+ * 双轨记忆系统：Qdrant 结构化知识库 + QMD 日记搜索引擎
+ * 压缩后端：oMLX Qwen3.5-9B-OptiQ-4bit（本地，零云端 token）
  */
 import { spawnSync, spawn } from 'child_process';
 import path from 'path';
@@ -12,15 +13,18 @@ const SKILL_PY = path.join(__dirname, 'atlas_skill.py');
 const SERVER_PORT = 16334;
 const PROXY_BYPASS = { NO_PROXY: 'localhost,127.0.0.1', no_proxy: 'localhost,127.0.0.1' };
 
-export const name = 'atlas-memory';
-export const description = 'ATLAS Memory Core — Qdrant vector memory backend';
+// Token 预算：注入上下文最大字符数
+const MAX_INJECT_CHARS = 800;
 
-// ── persistent server management ──────────────────────────────────────────────
+export const name = 'atlas-memory';
+export const description = 'ATLAS Memory Core v7.0.0 — 双轨记忆（Qdrant + QMD）+ oMLX 压缩';
+
+// ── 持久化 Python server 管理 ─────────────────────────────────────────────────
 
 let _serverProc = null;
 let _serverReady = false;
 
-function _startServer() {
+function _launchServer() {
   if (_serverProc) return;
   _serverProc = spawn('/opt/homebrew/bin/python3', [SKILL_PY, '--server'], {
     env: { ...process.env, ...PROXY_BYPASS },
@@ -33,6 +37,19 @@ function _startServer() {
   _serverProc.on('exit', () => { _serverProc = null; _serverReady = false; });
 }
 
+function _startServer() {
+  if (_serverProc || _serverReady) return;
+  const probe = http.request(
+    { hostname: '127.0.0.1', port: SERVER_PORT, path: '/stats', method: 'GET', timeout: 2000 },
+    (res) => {
+      if (res.statusCode === 200) { _serverReady = true; } else { _launchServer(); }
+    }
+  );
+  probe.on('error', _launchServer);
+  probe.on('timeout', () => { probe.destroy(); _launchServer(); });
+  probe.end();
+}
+
 function _callServer(cmd, args = []) {
   return new Promise((resolve) => {
     const argsParam = args.length ? '&args=' + encodeURIComponent(args.join('\x00')) : '';
@@ -41,7 +58,7 @@ function _callServer(cmd, args = []) {
       port: SERVER_PORT,
       path: `/${cmd}?${argsParam}`,
       method: 'GET',
-      timeout: 10000,
+      timeout: 12000,
     };
     const req = http.request(options, (res) => {
       let data = '';
@@ -74,13 +91,12 @@ async function callSkill(cmd, args = []) {
   return _callSubprocess(cmd, args);
 }
 
-// ── plugin registration (must be synchronous, no async default export) ────────
+// ── 工具注册 ──────────────────────────────────────────────────────────────────
 
 export function register(api) {
   _startServer();
 
-  // ── tools (factory format required by plugin system) ──────────────────────
-
+  // memory_store：存入 Qdrant 结构化知识库
   api.registerTool(
     () => ({
       name: 'memory_store',
@@ -106,16 +122,17 @@ export function register(api) {
     { names: ['memory_store'] }
   );
 
+  // atlas_search：Qdrant 结构化知识库搜索（原 memory_search 重命名，解冲突）
   api.registerTool(
     () => ({
-      name: 'memory_search',
-      description: '语义向量搜索记忆（Qdrant + nomic-embed-text）',
+      name: 'atlas_search',
+      description: '语义搜索结构化知识库（Qdrant：交易/客户/情报/视频等领域数据）',
       parameters: {
         type: 'object',
         properties: {
           query: { type: 'string', description: '搜索查询' },
           limit: { type: 'number', description: '返回数量，默认 5' },
-          threshold: { type: 'number', description: '相似度阈值，默认 0.65' },
+          threshold: { type: 'number', description: '相似度阈值，默认 0.55' },
         },
         required: ['query'],
       },
@@ -126,23 +143,47 @@ export function register(api) {
         return callSkill('search', args);
       },
     }),
-    { names: ['memory_search'] }
+    { names: ['atlas_search'] }
   );
 
+  // atlas_dual_search：双轨搜索（Qdrant + QMD 日记合并）
+  api.registerTool(
+    () => ({
+      name: 'atlas_dual_search',
+      description: '双轨记忆搜索：同时检索 Qdrant 结构化库 + QMD 日记库，自动合并排序。用于需要同时参考结构化知识和历史对话的场景。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索查询' },
+          limit: { type: 'number', description: '每路返回数量，默认 3' },
+        },
+        required: ['query'],
+      },
+      execute: () => (_id, { query, limit }) => {
+        const args = [query];
+        if (limit) args.push('-n', String(limit));
+        return callSkill('dual_search', args);
+      },
+    }),
+    { names: ['atlas_dual_search'] }
+  );
+
+  // memory_stats
   api.registerTool(
     () => ({
       name: 'memory_stats',
-      description: '获取记忆系统统计信息',
+      description: '获取 ATLAS 记忆系统统计信息（Qdrant 向量数、分类分布、压缩后端状态）',
       parameters: { type: 'object', properties: {} },
       execute: () => (_id, _p) => callSkill('stats', []),
     }),
     { names: ['memory_stats'] }
   );
 
+  // memory_list
   api.registerTool(
     () => ({
       name: 'memory_list',
-      description: '列出最近存储的记忆',
+      description: '列出最近存储的 Qdrant 记忆',
       parameters: {
         type: 'object',
         properties: { limit: { type: 'number', description: '数量，默认 10' } },
@@ -152,6 +193,7 @@ export function register(api) {
     { names: ['memory_list'] }
   );
 
+  // memory_optimize
   api.registerTool(
     () => ({
       name: 'memory_optimize',
@@ -165,26 +207,105 @@ export function register(api) {
     { names: ['memory_optimize'] }
   );
 
-  // ── before_prompt_build: 每轮对话前自动注入相关记忆 ──────────────────────
+  // memory_compress：oMLX 本地压缩
+  api.registerTool(
+    () => ({
+      name: 'memory_compress',
+      description: '用本地 oMLX Qwen3.5-9B-OptiQ-4bit 压缩长文本，不消耗云端 token',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: '要压缩的文本' },
+          ratio: { type: 'number', description: '目标压缩比例，默认 0.3' },
+        },
+        required: ['text'],
+      },
+      execute: () => (_id, { text, ratio }) => {
+        const args = [text];
+        if (ratio !== undefined) args.push('--ratio', String(ratio));
+        return callSkill('compress', args);
+      },
+    }),
+    { names: ['memory_compress'] }
+  );
+
+  // ── before_prompt_build：双轨自动注入相关记忆 ─────────────────────────────
 
   api.registerHook(
     'before_prompt_build',
     async (event) => {
       const { prompt } = event;
-      if (!prompt || prompt.trim().length < 6) return;
+      if (!prompt || prompt.trim().length < 10) return;
       if (prompt.trim().startsWith('/')) return;
       if (!_serverReady) return;
 
-      const result = await _callServer('search', [prompt.slice(0, 300), '-n', '3', '--threshold', '0.65']);
-      if (!result.success || !result.results || result.results.length === 0) return;
+      try {
+        // 并行查询 Qdrant + QMD（通过 dual_search）
+        const result = await _callServer('dual_search', [
+          prompt.slice(0, 300), '-n', '3', '--threshold', '0.58'
+        ]);
 
-      const lines = result.results.map((m) =>
-        `- [${m.created}][${m.category}] ${m.text}`
-      );
-      return {
-        prependContext: `## 相关记忆（ATLAS 记忆库）\n${lines.join('\n')}\n`,
-      };
+        if (!result.success || !result.results || result.results.length === 0) return;
+
+        // 分组格式化
+        const qdrantItems = result.results.filter(r => r.source === 'qdrant');
+        const qmdItems = result.results.filter(r => r.source === 'qmd');
+
+        const lines = [];
+        if (qdrantItems.length > 0) {
+          lines.push('### 知识库');
+          for (const m of qdrantItems) {
+            lines.push(`- [${m.created || ''}][${m.category || ''}] ${m.text}`);
+          }
+        }
+        if (qmdItems.length > 0) {
+          lines.push('### 日记');
+          for (const m of qmdItems) {
+            lines.push(`- ${m.title || ''}: ${m.text}`);
+          }
+        }
+
+        let memoryBlock = lines.join('\n');
+
+        // token 预算控制：超出 MAX_INJECT_CHARS 时用 oMLX 压缩
+        if (memoryBlock.length > MAX_INJECT_CHARS) {
+          const compressed = await _callServer('compress', [memoryBlock, '--ratio', '0.4']);
+          if (compressed.success && compressed.compressed) {
+            memoryBlock = compressed.compressed;
+          } else {
+            // 压缩失败则截断
+            memoryBlock = memoryBlock.slice(0, MAX_INJECT_CHARS) + '...';
+          }
+        }
+
+        return {
+          prependContext: `## 相关记忆（ATLAS v7）\n${memoryBlock}\n`,
+        };
+      } catch (e) {
+        // 静默失败，不影响主流程
+        return;
+      }
     },
-    { name: 'atlas-memory-context-inject', description: '每轮对话前注入相关 Qdrant 记忆' }
+    { name: 'atlas-memory-context-inject', description: '每轮对话前双轨注入相关记忆（Qdrant + QMD）' }
+  );
+
+  // ── after_agent_turn：自动捕获对话写入 Qdrant ────────────────────────────
+
+  api.registerHook(
+    'after_agent_turn',
+    async (event) => {
+      if (!_serverReady) return;
+      try {
+        const { assistantMessage } = event || {};
+        if (!assistantMessage || typeof assistantMessage !== 'string') return;
+        if (assistantMessage.trim().length < 100) return;
+
+        // 静默写入，不等待结果
+        _callServer('auto_capture', [assistantMessage.slice(0, 800)]).catch(() => {});
+      } catch (_e) {
+        // 严格静默，任何错误都不影响主流程
+      }
+    },
+    { name: 'atlas-memory-auto-capture', description: '每轮对话后自动捕获重要内容到 Qdrant' }
   );
 }

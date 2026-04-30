@@ -1,0 +1,17 @@
+{
+  "id": "atlas-memory",
+  "name": "ATLAS Memory Core",
+  "version": "7.0.0",
+  "description": "双轨记忆系统：Qdrant 结构化知识库 + QMD 日记搜索引擎，oMLX 本地压缩。",
+  "main": "index.js",
+  "author": "ATLAS Team",
+  "license": "MIT",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "qdrant_url": { "type": "string" },
+      "collection_name": { "type": "string" },
+      "embedding_model": { "type": "string" }
+    }
+  }
+}
