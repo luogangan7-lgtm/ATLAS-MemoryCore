@@ -1,0 +1,117 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace",
+      "model": {
+        "primary": "deepseek/deepseek-v4-flash",
+        "fallbacks": ["omlx/Qwen3.5-9B-OptiQ-4bit"]
+      },
+      "heartbeat": {
+        "model": "omlx/Qwen3.5-9B-OptiQ-4bit",
+        "every": "3m",
+        "target": "telegram",
+        "to": "YOUR_TELEGRAM_USER_ID"
+      },
+      "compaction": {
+        "reserveTokensFloor": 8000,
+        "model": "omlx/Qwen3.5-9B-OptiQ-4bit",
+        "recentTurnsPreserve": 6,
+        "mode": "default",
+        "omlx": {
+          "contextWindow": 131072
+        }
+      }
+    },
+    "instances": {
+      "main": {
+        "id": "main",
+        "name": "Main Agent",
+        "workspace": "~/.openclaw/workspace"
+      }
+    }
+  },
+  "plugins": {
+    "load": {
+      "paths": ["~/.openclaw/hooks"]
+    },
+    "allow": ["atlas-memory"],
+    "entries": {
+      "atlas-memory": {
+        "enabled": true,
+        "config": {
+          "qdrant_url": "http://127.0.0.1:6333",
+          "collection": "atlas_memories",
+          "ollama_url": "http://127.0.0.1:11434",
+          "embed_model": "nomic-embed-text:latest"
+        },
+        "hooks": {
+          "allowConversationAccess": true,
+          "allowPromptInjection": true
+        }
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "deepseek": {
+        "api": "openai-completions",
+        "baseUrl": "https://api.deepseek.com",
+        "apiKey": "YOUR_DEEPSEEK_API_KEY",
+        "models": [
+          {
+            "id": "deepseek-v4-flash",
+            "name": "DeepSeek V4 Flash",
+            "contextWindow": 1000000
+          },
+          {
+            "id": "deepseek-v4-pro",
+            "name": "DeepSeek V4 Pro",
+            "contextWindow": 1000000
+          }
+        ]
+      },
+      "anthropic": {
+        "api": "anthropic-messages",
+        "baseUrl": "https://api.anthropic.com",
+        "apiKey": "YOUR_ANTHROPIC_API_KEY",
+        "models": [
+          {
+            "id": "claude-opus-4-7",
+            "name": "Claude Opus",
+            "contextWindow": 200000,
+            "input": ["text", "image"]
+          },
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet",
+            "contextWindow": 200000,
+            "input": ["text", "image"]
+          }
+        ]
+      },
+      "omlx": {
+        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:7749/v1",
+        "apiKey": "YOUR_OMLX_API_KEY",
+        "models": [
+          {
+            "id": "Qwen3.5-9B-OptiQ-4bit",
+            "name": "Qwen3.5-9B OptiQ (Local)",
+            "contextWindow": 131072
+          }
+        ]
+      },
+      "ollama": {
+        "api": "ollama",
+        "baseUrl": "http://localhost:11434",
+        "models": [
+          {
+            "id": "nomic-embed-text:latest",
+            "name": "Nomic Embed Text (Local)"
+          }
+        ]
+      }
+    }
+  }
+}
