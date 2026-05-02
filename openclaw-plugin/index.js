@@ -1,5 +1,5 @@
 /**
- * ATLAS Memory v9.4.0 — Commercial-Grade Semantic Memory + Obsidian Bridge
+ * ATLAS Memory v9.5.0 — Commercial-Grade Semantic Memory + Obsidian Bridge
  *
  * 架构（四层，商业级）：
  *   INJECT  — LRU缓存 + 跳过短/重复 + 时间衰减 + 访问计数 + 注入 memory_type
@@ -23,6 +23,14 @@
  *   ★ 图谱融合：聚类文件底部生成 [[wikilinks]]，接入 Obsidian 知识图谱
  *   ★ 每日进化日志：_evolution/YYYY-MM-DD.md 按天切分，记录 CAPTURE/MERGE/PRUNE/UPGRADE
  *   ★ Dataview 仪表盘：_index.md 含空数据降级提示
+ *
+ * v9.5.0 升级：
+ *   ★ atlas_feedback — 记忆反馈回路（负评降权/删除，防止错误记忆加权）
+ *   ★ atlas_distill  — 知识提炼（DeepSeek云端合成通则，omlx备用）
+ *   ★ atlas_timeline — 主题时间线查询
+ *   ★ 版本化         — 冲突替换时保留旧版本（status:superseded），不再物理删除
+ *   ★ INJECT改进    — 自动过滤负评记忆，优先注入[distilled]通则，追踪注入ID
+ *   ★ EVOLVE自动提炼 — 同标签≥5条时自动触发distill，生成通则进入下次检索
  */
 
 import http from 'http';
@@ -64,6 +72,22 @@ const STALE_AGE_DAYS       = 90;    // ★ 过期记忆清理阈值
 const MIN_QUALITY_SCORE    = 7;     // ★ 只存质量≥7的记忆
 const SEARCH_TOOL_KEYWORDS = ['search', 'harvester', 'google', 'brave', 'bing', 'duckduckgo', 'serp'];
 
+// ── DeepSeek（云端合成，用于 distill）────────────────────────────────────────
+const DEEPSEEK_URL          = 'https://api.deepseek.com';
+const DEEPSEEK_MODEL        = 'deepseek-chat';
+const DEEPSEEK_TIMEOUT_MS   = 30_000;
+const DEEPSEEK_API_KEY      = process.env.DEEPSEEK_API_KEY ?? '';
+
+// ── 反馈回路 ──────────────────────────────────────────────────────────────────
+const FEEDBACK_DECAY        = 0.25;   // 负反馈降幅（wrong/outdated）
+const FEEDBACK_BOOST        = 0.05;   // 正反馈升幅（correct）
+const FEEDBACK_FILTER_MIN   = 0.5;    // INJECT 过滤门槛（低于此值不注入）
+const FEEDBACK_DELETE_FLOOR = 0.2;    // 低于此值直接删除
+
+// ── 知识提炼 ──────────────────────────────────────────────────────────────────
+const DISTILL_MIN_COUNT     = 5;      // 同标签最少记忆数才触发提炼
+const DISTILL_TAG           = '[distilled]';
+
 // ── Obsidian Bridge 常量 ───────────────────────────────────────────────────────
 const OBSIDIAN_VAULT         = process.env.ATLAS_OBSIDIAN_VAULT ?? '';
 const OBSIDIAN_MIRROR_DIR    = 'Atlas_Mirror';
@@ -80,6 +104,8 @@ const sessionTurns   = new Map();
 let lastInjectKey    = '';
 let lastInjectResult = undefined;
 let lastBackupTime   = null;
+let   lastInjectedIds        = [];             // ★ INJECT 注入的记忆 ID，供 feedback 定位
+const distillWrittenHashes   = new Set();      // ★ distill 已写入的 hash，阻止 CAPTURE 二次捕获
 
 // ── HTTP/HTTPS 工具 ───────────────────────────────────────────────────────────
 function httpReq(url, method = 'GET', body = null, extraHeaders = {}, timeoutMs = TIMEOUT_MS) {
@@ -208,6 +234,29 @@ async function omlxGenerate(systemMsg, userMsg, maxTokens = 800) {
     },
     {},
     EXTRACT_TIMEOUT_MS,
+  );
+  if (!r.ok) return null;
+  return r.body?.choices?.[0]?.message?.content ?? null;
+}
+
+// ── ★ DeepSeek 云端推理（用于 distill 等复杂合成，token 有限制）─────────────
+async function deepseekGenerate(systemMsg, userMsg, maxTokens = 400) {
+  const key = DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY;
+  if (!key) return null;
+  const r = await httpReq(
+    `${DEEPSEEK_URL}/v1/chat/completions`, 'POST',
+    {
+      model:       DEEPSEEK_MODEL,
+      messages:    [
+        { role: 'system', content: systemMsg },
+        { role: 'user',   content: userMsg   },
+      ],
+      temperature: 0.3,
+      max_tokens:  maxTokens,
+      stream:      false,
+    },
+    { Authorization: `Bearer ${key}` },
+    DEEPSEEK_TIMEOUT_MS,
   );
   if (!r.ok) return null;
   return r.body?.choices?.[0]?.message?.content ?? null;
@@ -405,11 +454,17 @@ async function upsert(vector, payload) {
 
 async function qdrantSearch(vector, { limit = 5, category, minScore = SCORE_MIN } = {}) {
   const body = { vector, limit, with_payload: true, score_threshold: minScore };
+  // ★ 永远过滤 superseded 版本
+  const mustNot = [{ key: 'status', match: { value: 'superseded' } }];
   if (category && category !== 'any') {
-    body.filter = { must: [{ key: 'category', match: { value: category } }] };
+    body.filter = { must: [{ key: 'category', match: { value: category } }], must_not: mustNot };
+  } else {
+    body.filter = { must_not: mustNot };
   }
   const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/search`, 'POST', body);
-  return r.ok ? (r.body?.result ?? []) : [];
+  if (!r.ok) return [];
+  // ★ 过滤负反馈记忆（feedback_score < FEEDBACK_FILTER_MIN，undefined 视为正常）
+  return (r.body?.result ?? []).filter(h => (h.payload?.feedback_score ?? 1.0) >= FEEDBACK_FILTER_MIN);
 }
 
 async function qdrantDelete(ids) {
@@ -420,8 +475,16 @@ async function qdrantDelete(ids) {
   return { ok: r.ok, deleted: ids.length };
 }
 
+async function qdrantPatchPayload(id, patch) {
+  return httpReq(
+    `${QDRANT}/collections/${COLLECTION}/points/payload`, 'POST',
+    { payload: patch, points: [id] },
+  );
+}
+
 function fmtHits(hits) {
   return hits.map(h => ({
+    id:               h.id,               // ★ 供 atlas_feedback 定位使用
     content:          h.payload?.content,
     category:         h.payload?.category,
     importance:       h.payload?.importance,
@@ -437,13 +500,114 @@ function fmtHits(hits) {
 
 function formatInjectContext(hits) {
   if (!hits.length) return '';
-  const lines = hits.map(h => {
+  // ★ 通则([distilled])优先排在最前面
+  const sorted = [...hits].sort((a, b) => {
+    const aD = (a.payload?.tags ?? []).includes(DISTILL_TAG) ? 1 : 0;
+    const bD = (b.payload?.tags ?? []).includes(DISTILL_TAG) ? 1 : 0;
+    return bD - aD;
+  });
+  const lines = sorted.map(h => {
     const imp  = h.payload?.importance ?? 'medium';
     const type = h.payload?.memory_type ? `[${h.payload.memory_type}]` : '';
+    const dist = (h.payload?.tags ?? []).includes(DISTILL_TAG) ? '[通则]' : '';
     const text = h.payload?.content ?? '';
-    return `• [${imp}]${type} ${text}`;
+    return `• [${imp}]${type}${dist} ${text}`;
   });
   return `<atlas_memory>\n以下是与当前对话相关的历史记忆（ATLAS Memory 自动检索）：\n${lines.join('\n')}\n</atlas_memory>`;
+}
+
+// ── ★ 知识提炼内部存储 ────────────────────────────────────────────────────────
+async function _storeDistilled(tag, content, basis) {
+  const vector = await embed(content);
+  if (!vector) return null;
+  await ensureCollection();
+  const payload = {
+    content,
+    category:         'work',
+    importance:       'high',
+    tags:             [tag, DISTILL_TAG],
+    memory_type:      'skill',
+    created_at:       new Date().toISOString(),
+    source:           'distill',
+    session_key:      'system',
+    hit_count:        0,
+    last_accessed_at: null,
+    status:           'active',
+    feedback_score:   1.0,
+    distill_basis:    basis,
+  };
+  const h = createHash('sha256').update(content.slice(0, 200)).digest('hex').slice(0, 16);
+  distillWrittenHashes.add(h);
+  const r = await upsert(vector, payload);
+  return r.ok ? { ok: true, id: r.id, content, basis } : null;
+}
+
+// ── ★ 知识提炼主流程（DeepSeek 优先，omlx 备用）─────────────────────────────
+async function distillTagMemories(tag, logger, force = false) {
+  // 1. 拉取该标签下的非superseded、非distilled记忆
+  let offset = null;
+  const tagPoints = [];
+  do {
+    const body = {
+      limit: 50, with_payload: true, with_vector: false,
+      filter: {
+        must: [{ key: 'tags', match: { value: tag } }],
+        must_not: [
+          { key: 'status', match: { value: 'superseded' } },
+          { key: 'tags',   match: { value: DISTILL_TAG  } },
+        ],
+      },
+    };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    tagPoints.push(...(r.body?.result?.points ?? []));
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null && tagPoints.length < 100);
+
+  if (tagPoints.length < DISTILL_MIN_COUNT) {
+    return { ok: false, skipped: true, reason: `"${tag}" 下只有 ${tagPoints.length} 条记忆，需要 ≥${DISTILL_MIN_COUNT} 条` };
+  }
+
+  // 2. 检查是否已有通则（force=true 时跳过检查）
+  if (!force) {
+    const checkR = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', {
+      limit: 5, with_payload: false, with_vector: false,
+      filter: {
+        must: [
+          { key: 'tags', match: { value: tag        } },
+          { key: 'tags', match: { value: DISTILL_TAG } },
+        ],
+        must_not: [{ key: 'status', match: { value: 'superseded' } }],
+      },
+    });
+    if (checkR.ok && (checkR.body?.result?.points ?? []).length > 0) {
+      return { ok: false, skipped: true, reason: `"${tag}" 已有通则，使用 force:true 强制重新提炼` };
+    }
+  }
+
+  // 3. 构建提炼提示（token 控制：最多 10 条，截断至 1800 字符）
+  const topMems = tagPoints
+    .sort((a, b) => (b.payload?.hit_count ?? 0) - (a.payload?.hit_count ?? 0))
+    .slice(0, 10)
+    .map((p, i) => `${i + 1}. [${p.payload?.importance ?? 'medium'}] ${(p.payload?.content ?? '').slice(0, 150)}`)
+    .join('\n');
+
+  const sys  = '你是知识提炼专家。从多条经验中提炼出一条简洁、可直接应用的"通则"。只输出通则内容，不超过150字，不要编号和解释。';
+  const user = `标签：${tag}\n\n原始经验：\n${topMems.slice(0, 1800)}\n\n提炼通则：`;
+
+  // 4. 调用 DeepSeek（优先）或 omlx（备用）
+  let principle = null;
+  if (DEEPSEEK_API_KEY) {
+    principle = await deepseekGenerate(sys, user, 300);
+  }
+  if (!principle?.trim()) {
+    logger?.warn?.('[atlas-memory] distill: DeepSeek 不可用，回退 omlx');
+    principle = await omlxGenerate(sys, user, 200);
+  }
+  if (!principle?.trim()) return null;
+
+  return await _storeDistilled(tag, principle.trim(), tagPoints.length);
 }
 
 // ── ★ 带冲突检测的存储 ────────────────────────────────────────────────────────
@@ -455,6 +619,7 @@ async function storeWithConflict({ content, category = 'work', importance = 'med
   const exactDup = await qdrantSearch(vector, { limit: 1, minScore: SCORE_DEDUP });
   if (exactDup.length) return { ok: true, deduplicated: true, similar: exactDup[0].payload?.content?.slice(0, 80) };
 
+  let supersededId = null;  // ★ 版本化：记录被替换的旧版本 ID
   // ★ 冲突检测（仅 medium 以上重要性，避免对低价值内容浪费 omlx）
   if (doConflictCheck && IMPORTANCE_LEVELS.indexOf(importance) >= 1) {
     const candidates = await qdrantSearch(vector, { limit: 3, minScore: SCORE_CONFLICT_MIN });
@@ -467,9 +632,11 @@ async function storeWithConflict({ content, category = 'work', importance = 'med
         if (res.action === 'keep_old') {
           return { ok: true, skipped: true, reason: 'conflict_keep_old' };
         } else if (res.action === 'keep_new' && conflictId) {
-          await qdrantDelete([conflictId]);
+          supersededId = conflictId;  // ★ 版本化：不删除，标记为 superseded
+          await qdrantPatchPayload(conflictId, { status: 'superseded', superseded_at: new Date().toISOString() });
         } else if (res.action === 'merge' && res.merged_content?.trim() && conflictId) {
-          await qdrantDelete([conflictId]);
+          supersededId = conflictId;  // ★ 版本化：合并时也保留旧版本
+          await qdrantPatchPayload(conflictId, { status: 'superseded', superseded_at: new Date().toISOString() });
           content = res.merged_content.trim();
         }
       }
@@ -489,8 +656,14 @@ async function storeWithConflict({ content, category = 'work', importance = 'med
     session_key:      sessionKey ?? 'unknown',
     hit_count:        0,
     last_accessed_at: null,
+    status:           'active',      // ★ 版本化
+    feedback_score:   1.0,           // ★ 反馈回路
   };
   const result = await upsert(vector, payload);
+  if (result.ok && supersededId) {
+    // ★ 版本链：补充 superseded_by 指向新版本
+    await qdrantPatchPayload(supersededId, { superseded_by: result.id }).catch(() => {});
+  }
   return result.ok ? { ok: true, id: result.id } : { ok: false, error: result.error || 'Qdrant 写入失败' };
 }
 
@@ -516,6 +689,9 @@ async function batchStoreMemories(facts, source, sessionKey, doConflictCheck = f
   let skipped      = 0;
 
   for (const { f, vector } of valid) {
+    // ★ 跳过 distill 刚写入的内容（防 CAPTURE 二次捕获）
+    const ch = createHash('sha256').update(f.content.trim().slice(0, 200)).digest('hex').slice(0, 16);
+    if (distillWrittenHashes.has(ch)) { deduplicated++; continue; }
     // 精确去重
     const dup = await qdrantSearch(vector, { limit: 1, minScore: SCORE_DEDUP });
     if (dup.length) { deduplicated++; continue; }
@@ -556,6 +732,8 @@ async function batchStoreMemories(facts, source, sessionKey, doConflictCheck = f
         session_key:      sessionKey ?? 'unknown',
         hit_count:        0,
         last_accessed_at: null,
+        status:           'active',   // ★ 版本化
+        feedback_score:   1.0,        // ★ 反馈回路
       },
     });
   }
@@ -597,8 +775,9 @@ async function runEvolution(logger) {
   const toDelete = new Set();
   const now      = Date.now();
 
-  // ★ 过期清理：hit_count=0 + age>90天 + importance='low'
+  // ★ 过期清理：hit_count=0 + age>90天 + importance='low'（跳过历史版本）
   for (const pt of pointsWithVecs) {
+    if (pt.payload?.status === 'superseded') continue;  // ★ 版本历史永不过期清理
     const hitCount  = pt.payload?.hit_count ?? 0;
     const imp       = pt.payload?.importance ?? 'medium';
     const created   = pt.payload?.created_at ? new Date(pt.payload.created_at).getTime() : now;
@@ -608,9 +787,10 @@ async function runEvolution(logger) {
     }
   }
 
-  // 相似度去重
+  // 相似度去重（跳过历史版本）
   for (const pt of pointsWithVecs) {
     if (toDelete.has(pt.id) || !pt.vector) continue;
+    if (pt.payload?.status === 'superseded') continue;  // ★ 不对历史版本做去重
     const similar = await qdrantSearch(pt.vector, { limit: 5, minScore: SCORE_DEDUP });
     for (const hit of similar) {
       if (hit.id === pt.id || toDelete.has(hit.id)) continue;
@@ -624,8 +804,36 @@ async function runEvolution(logger) {
     await qdrantDelete([...toDelete]);
     appendEvolutionLog('PRUNE', `清理 ${toDelete.size} 条记忆（过期/重复），剩余 ${allIds.length - toDelete.size} 条`).catch(() => {});
   }
-  logger?.info?.(`[atlas-memory] 进化完成：总数 ${allIds.length}，删除 ${toDelete.size} 条（包含过期清理）`);
-  return { total: allIds.length, removed: toDelete.size };
+  // ★ 自动提炼：统计标签分布，对积累 ≥ DISTILL_MIN_COUNT 条的标签自动生成通则
+  const tagCount = new Map();
+  for (const pt of pointsWithVecs) {
+    if (pt.payload?.status === 'superseded') continue;
+    if ((pt.payload?.tags ?? []).includes(DISTILL_TAG)) continue;
+    for (const tag of (pt.payload?.tags ?? [])) {
+      if (tag !== DISTILL_TAG) tagCount.set(tag, (tagCount.get(tag) ?? 0) + 1);
+    }
+  }
+  const distillCandidates = [];
+  for (const [tag, count] of tagCount) {
+    if (count >= DISTILL_MIN_COUNT) {
+      const hasDistilled = pointsWithVecs.some(pt =>
+        !pt.payload?.status?.includes('superseded') &&
+        (pt.payload?.tags ?? []).includes(DISTILL_TAG) &&
+        (pt.payload?.tags ?? []).includes(tag)
+      );
+      if (!hasDistilled) distillCandidates.push({ tag, count });
+    }
+  }
+  let distilled = 0;
+  for (const { tag } of distillCandidates.sort((a, b) => b.count - a.count).slice(0, 3)) {
+    const r = await distillTagMemories(tag, logger).catch(() => null);
+    if (r?.ok) {
+      distilled++;
+      appendEvolutionLog('DISTILL', `自动提炼"${tag}"：${r.basis}条 → 通则（id:${r.id?.slice(0, 8)}）`).catch(() => {});
+    }
+  }
+  logger?.info?.(`[atlas-memory] 进化完成：总数 ${allIds.length}，删除 ${toDelete.size} 条，自动提炼 ${distilled} 条通则`);
+  return { total: allIds.length, removed: toDelete.size, distilled };
 }
 
 // ── ⑦ 备份 ───────────────────────────────────────────────────────────────────
@@ -904,7 +1112,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v9.4.0 — 商业级语义记忆 + Obsidian Bridge（进化监控台 · 主题聚类 · 图谱融合 · 每日进化日志）';
+export const description = 'ATLAS Memory v9.5.0 — 商业级语义记忆 + Obsidian Bridge（反馈回路 · 知识提炼 · 版本化 · 主题时间线 · 进化监控台）';
 
 export function register(api) {
   const logger = api.logger;
@@ -938,6 +1146,7 @@ export function register(api) {
         const hits = await qdrantSearch(vector, { limit: INJECT_LIMIT });
         if (!hits.length) return undefined;
         const decayed = applyTimeDecay(hits);
+        lastInjectedIds = decayed.map(h => h.id);  // ★ 追踪注入 ID，供 feedback 定位
         trackAccess(decayed).catch(() => {});
         return { prependContext: formatInjectContext(decayed) };
       })();
@@ -1141,7 +1350,7 @@ export function register(api) {
       const omlxModels   = omlxRes.ok  ? (omlxRes.body?.data   ?? []).map(m => m.id)    : [];
       const total        = embedCacheHits + embedCacheMisses;
       return jsonResult({
-        version: '9.4.0',
+        version: '9.5.0',
         qdrant: {
           ok:         qdrantRes.ok,
           collection: COLLECTION,
@@ -1162,10 +1371,14 @@ export function register(api) {
         active_sessions:   sessionTurns.size,
         features: {
           extract_model:   `omlx ${OMLX_MODEL}（4s/次，thinking关闭）`,
+          distill_model:   `deepseek-chat（云端，omlx备用）`,
           conflict_detect: `开启（agent_end+atlas_store，medium+重要性触发）`,
           quality_filter:  `≥${MIN_QUALITY_SCORE}/10`,
-          memory_types:    'preference|fact|skill|project|constraint|event',
+          memory_types:    'preference|fact|skill|project|constraint|event|[distilled]',
           time_decay:      `${DECAY_PERIOD_DAYS}天半衰期，最大惩罚${DECAY_MAX_PENALTY * 100}%`,
+          feedback:        `正反馈+${FEEDBACK_BOOST}，负反馈-${FEEDBACK_DECAY}，删除门槛${FEEDBACK_DELETE_FLOOR}`,
+          versioning:      '冲突替换保留历史（status:superseded），不物理删除',
+          auto_distill:    `EVOLVE 24h 扫描，同标签≥${DISTILL_MIN_COUNT}条自动提炼通则`,
         },
         obsidian_bridge: {
           enabled:     Boolean(OBSIDIAN_VAULT),
@@ -1422,6 +1635,158 @@ ${content}
       } catch (e) {
         return jsonResult({ error: e.message });
       }
+    },
+  }));
+
+  // ★ atlas_feedback — 记忆反馈回路
+  api.registerTool(() => ({
+    name: 'atlas_feedback',
+    description:
+      '对刚才引用的记忆进行反馈评价。' +
+      'correct=提升权重，wrong/outdated=降低权重（累计低于阈值自动删除）。' +
+      '用户说"不对/你记错了/过时了"时主动调用。',
+    parameters: {
+      type: 'object', required: ['verdict'],
+      properties: {
+        query:   { type: 'string',  description: '记忆内容的关键词（用于语义定位，与 id 二选一）' },
+        id:      { type: 'string',  description: '记忆 ID（从 atlas_recall 结果获取，优先使用）' },
+        verdict: { type: 'string',  enum: ['correct', 'wrong', 'outdated'], description: '评价结果' },
+        reason:  { type: 'string',  description: '评价原因（可选）' },
+      },
+    },
+    execute: async (_callId, params) => {
+      const { query, id, verdict, reason = '' } = params ?? {};
+      if (!verdict) return jsonResult({ error: 'verdict 不能为空' });
+
+      let targetId      = id ?? null;
+      let targetContent = '';
+
+      // 未提供 id：语义搜索，优先从最近注入的记忆中匹配
+      if (!targetId && query) {
+        const vector = await embed(query);
+        if (vector) {
+          const hits = await qdrantSearch(vector, { limit: 5, minScore: 0.6 });
+          const recentHit = hits.find(h => lastInjectedIds.includes(h.id)) ?? hits[0];
+          if (recentHit) { targetId = recentHit.id; targetContent = recentHit.payload?.content?.slice(0, 80) ?? ''; }
+        }
+      }
+      if (!targetId) return jsonResult({ error: '未找到目标记忆，请提供 id 或更精确的 query' });
+
+      // 获取当前 feedback_score
+      const getR = await httpReq(`${QDRANT}/collections/${COLLECTION}/points`, 'POST', {
+        ids: [targetId], with_payload: true, with_vector: false,
+      });
+      if (!getR.ok || !getR.body?.result?.[0]) return jsonResult({ error: '记忆不存在或已删除' });
+
+      const current      = getR.body.result[0];
+      const currentScore = current.payload?.feedback_score ?? 1.0;
+      targetContent      = targetContent || current.payload?.content?.slice(0, 80) ?? '';
+
+      const delta    = verdict === 'correct' ? FEEDBACK_BOOST : -FEEDBACK_DECAY;
+      const newScore = Math.max(0, Math.min(1, currentScore + delta));
+
+      if (newScore <= FEEDBACK_DELETE_FLOOR) {
+        await qdrantDelete([targetId]);
+        appendEvolutionLog('FEEDBACK', `删除（负评累积）"${targetContent}" ${reason ? `[${reason}]` : ''}`).catch(() => {});
+        return jsonResult({
+          ok: true, action: 'deleted',
+          reason: `feedback_score ${currentScore.toFixed(2)}→${newScore.toFixed(2)} ≤ ${FEEDBACK_DELETE_FLOOR}`,
+          memory: targetContent,
+        });
+      }
+
+      await qdrantPatchPayload(targetId, { feedback_score: newScore });
+      appendEvolutionLog('FEEDBACK', `${verdict === 'correct' ? '✓' : '✗'} "${targetContent}" score:${currentScore.toFixed(2)}→${newScore.toFixed(2)} ${reason ? `[${reason}]` : ''}`).catch(() => {});
+      return jsonResult({
+        ok: true, action: 'updated', verdict,
+        feedback_score: { before: currentScore, after: newScore },
+        memory: targetContent,
+      });
+    },
+  }));
+
+  // ★ atlas_distill — 知识提炼（DeepSeek 云端合成通则）
+  api.registerTool(() => ({
+    name: 'atlas_distill',
+    description:
+      '对指定标签下的多条记忆进行知识提炼，使用 DeepSeek 合成一条高质量"通则"（不足 5 条则报错）。' +
+      '通则会优先注入到下次对话上下文中。',
+    parameters: {
+      type: 'object', required: ['tag'],
+      properties: {
+        tag:   { type: 'string',  description: '要提炼的标签名' },
+        force: { type: 'boolean', default: false, description: '强制重新提炼（覆盖已有通则）' },
+      },
+    },
+    execute: async (_callId, params) => {
+      const { tag, force = false } = params ?? {};
+      if (!tag?.trim()) return jsonResult({ error: 'tag 不能为空' });
+      const result = await distillTagMemories(tag.trim(), logger, force);
+      if (!result) return jsonResult({ error: 'distill 失败（DeepSeek 和 omlx 均不可用）' });
+      if (result.skipped) return jsonResult({ ok: true, skipped: true, reason: result.reason });
+      appendEvolutionLog('DISTILL', `手动提炼"${tag}"：${result.basis}条 → 通则 (id:${result.id?.slice(0, 8)})`).catch(() => {});
+      return jsonResult({ ok: true, tag, ...result });
+    },
+  }));
+
+  // ★ atlas_timeline — 主题时间线
+  api.registerTool(() => ({
+    name: 'atlas_timeline',
+    description: '按时间线查看某标签下所有记忆的演进（创建时间排序）。用于追踪话题知识演进史。',
+    parameters: {
+      type: 'object', required: ['tag'],
+      properties: {
+        tag:   { type: 'string',  description: '标签名' },
+        limit: { type: 'integer', default: 20, minimum: 1, maximum: 100 },
+        order: { type: 'string',  enum: ['asc', 'desc'], default: 'desc', description: 'desc=最新在前' },
+      },
+    },
+    execute: async (_callId, params) => {
+      const { tag, limit = 20, order = 'desc' } = params ?? {};
+      if (!tag?.trim()) return jsonResult({ error: 'tag 不能为空' });
+
+      let offset = null;
+      const allPoints = [];
+      do {
+        const body = {
+          limit: 100, with_payload: true, with_vector: false,
+          filter: {
+            must:     [{ key: 'tags', match: { value: tag.trim() } }],
+            must_not: [{ key: 'status', match: { value: 'superseded' } }],
+          },
+        };
+        if (offset != null) body.offset = offset;
+        const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+        if (!r.ok) break;
+        allPoints.push(...(r.body?.result?.points ?? []));
+        offset = r.body?.result?.next_page_offset ?? null;
+      } while (offset != null && allPoints.length < 500);
+
+      if (!allPoints.length) return jsonResult({ tag, count: 0, timeline: [] });
+
+      const sorted = allPoints
+        .sort((a, b) => {
+          const ta = new Date(a.payload?.created_at ?? 0).getTime();
+          const tb = new Date(b.payload?.created_at ?? 0).getTime();
+          return order === 'desc' ? tb - ta : ta - tb;
+        })
+        .slice(0, limit);
+
+      return jsonResult({
+        tag,
+        total:    allPoints.length,
+        showing:  sorted.length,
+        timeline: sorted.map(h => ({
+          id:           h.id,
+          date:         (h.payload?.created_at ?? '').slice(0, 10),
+          content:      h.payload?.content,
+          importance:   h.payload?.importance,
+          memory_type:  h.payload?.memory_type,
+          hit_count:    h.payload?.hit_count ?? 0,
+          feedback_score: h.payload?.feedback_score ?? 1.0,
+          is_distilled: (h.payload?.tags ?? []).includes(DISTILL_TAG),
+        })),
+      });
     },
   }));
 }
