@@ -1680,7 +1680,7 @@ ${content}
 
       const current      = getR.body.result[0];
       const currentScore = current.payload?.feedback_score ?? 1.0;
-      targetContent      = targetContent || current.payload?.content?.slice(0, 80) ?? '';
+      targetContent      = targetContent || current.payload?.content?.slice(0, 80) || '';
 
       const delta    = verdict === 'correct' ? FEEDBACK_BOOST : -FEEDBACK_DECAY;
       const newScore = Math.max(0, Math.min(1, currentScore + delta));
