@@ -1,29 +1,85 @@
-# ATLAS Memory — 全新安装配置指南
+# ATLAS Memory — 安装配置指南
 
-> atlas-memory v9.4.0 | OpenClaw 2026.4.x | 2026-05-01
+> atlas-memory v9.5.0 | OpenClaw 2026.4.x | 2026-05-03
 
 ---
 
 ## 一、前置依赖
 
-| 依赖 | 安装命令 | 用途 |
+### 本地服务（必须）
+
+| 依赖 | 安装方式 | 用途 |
 |------|----------|------|
-| Qdrant | `docker run -p 6333:6333 qdrant/qdrant` | 向量数据库 |
-| Ollama | [ollama.com](https://ollama.com) | nomic-embed-text 嵌入 |
-| nomic-embed-text | `ollama pull nomic-embed-text:latest` | 768-dim 向量嵌入 |
-| omlx (本地 LLM) | 按 omlx 文档安装 | 冲突检测 / 提取 / 压缩 |
-| Qwen3.5-9B-OptiQ-4bit | 在 omlx 中加载 | 4s/call 推理 |
+| **Qdrant** | `docker run -d -p 6333:6333 --restart unless-stopped qdrant/qdrant` | 向量数据库 |
+| **Ollama** | [ollama.com](https://ollama.com) 下载安装 | 文本嵌入服务 |
+| **nomic-embed-text** | `ollama pull nomic-embed-text:latest` | 768-dim 向量嵌入（274MB） |
+| **omlx** | 按 omlx 文档安装 | 事实提取 / 冲突检测 |
+| **Qwen3.5-9B-OptiQ-4bit** | 在 omlx 中加载 | 本地推理，4s/call |
+
+### 云端服务（可选，用于知识提炼）
+
+| 服务 | 获取方式 | 用途 |
+|------|----------|------|
+| **DeepSeek API Key** | [platform.deepseek.com](https://platform.deepseek.com) | `atlas_distill` 知识合成 |
+
+> `DEEPSEEK_API_KEY` 未配置时，distill 功能自动回退到本地 omlx，所有其他功能不受影响。
 
 启动确认：
+
 ```bash
-curl http://127.0.0.1:6333/healthz          # Qdrant
-curl http://127.0.0.1:11434/api/tags        # Ollama
-curl http://127.0.0.1:7749/v1/models        # omlx
+curl http://127.0.0.1:6333/healthz          # Qdrant ✓
+curl http://127.0.0.1:11434/api/tags        # Ollama ✓
+curl http://127.0.0.1:7749/v1/models        # omlx ✓
 ```
 
 ---
 
-## 二、安装 OpenClaw
+## 二、模型选型参考
+
+### 本地嵌入模型
+
+| 模型 | 维度 | 大小 | 说明 |
+|------|------|------|------|
+| `nomic-embed-text:latest`（**当前默认**） | 768 | 274MB | 速度快，中英文均可 |
+| `mxbai-embed-large` | 1024 | 670MB | 精度更高，需重建 Qdrant collection |
+
+> ⚠️ 切换嵌入模型需同步修改常量 `VECTOR_DIM` 并删除重建 `atlas_memories` collection，否则已有记忆向量失效。
+
+### 本地推理模型（omlx）
+
+| 模型 | 速度 | 说明 |
+|------|------|------|
+| `Qwen3.5-9B-OptiQ-4bit`（**当前默认**） | 4s/call | thinking模式需关闭（见陷阱7.5） |
+| `Qwen2.5-7B-Instruct` | 2–3s/call | 速度更快，提取精度稍低 |
+
+### 云端推理模型（DeepSeek，仅 distill）
+
+| 模型 | 输入/输出（per 1M tokens） | 说明 |
+|------|--------------------------|------|
+| `deepseek-chat`（**当前默认**） | $0.28 / $0.42 | 知识提炼，性价比最优 |
+| `deepseek-v4-flash` | $0.14 / $0.28 | 更快更便宜，适合批量提炼 |
+| `deepseek-v4-pro` | $1.74 / $3.48 | 复杂推理，通常不必要 |
+
+---
+
+## 三、哪些操作调用云端模型
+
+| 操作 | 调用模型 | 频率 | 估算费用 |
+|------|---------|------|---------|
+| INJECT 自动检索 | 本地 Qdrant + Ollama | 每次提问 | $0 |
+| CAPTURE 自动捕获 | 本地 omlx | 每次对话结束 | $0 |
+| LEARN 网页学习 | 本地 omlx | 每次搜索工具调用 | $0 |
+| atlas_recall | 本地 Qdrant + Ollama | 手动调用 | $0 |
+| atlas_feedback | 本地 Qdrant（无LLM） | 手动调用 | $0 |
+| atlas_merge | 本地 omlx | 手动调用 | $0 |
+| **atlas_distill** | **DeepSeek deepseek-chat** | 手动 / EVOLVE 24h 自动（≥5条同标签） | **≈$0.0003/次** |
+| EVOLVE 自动提炼 | **DeepSeek deepseek-chat** | 每24h最多3个标签 | **≈$0.001/天** |
+
+**月消耗上限估算：** 正常使用场景 < $0.05/月。
+
+---
+
+## 四、安装 OpenClaw
 
 ```bash
 npm install -g openclaw
@@ -32,136 +88,157 @@ openclaw setup
 
 ---
 
-## 三、部署 atlas-memory 插件
+## 五、部署 atlas-memory 插件
 
 ```bash
-# 1. 创建插件目录（默认加载路径）
+# 1. 创建插件目录
 mkdir -p ~/.openclaw/hooks/atlas-memory
 
 # 2. 克隆本仓库
-git clone https://github.com/luogangan7-lgtm/atlas-config-sync /tmp/atlas-config-sync
+git clone https://github.com/luogangan7-lgtm/ATLAS-MemoryCore /tmp/ATLAS-MemoryCore
 
 # 3. 复制插件文件
-cp /tmp/atlas-config-sync/atlas-memory/index.js ~/.openclaw/hooks/atlas-memory/
-cp /tmp/atlas-config-sync/atlas-memory/openclaw.plugin.json ~/.openclaw/hooks/atlas-memory/
+cp /tmp/ATLAS-MemoryCore/openclaw-plugin/index.js ~/.openclaw/hooks/atlas-memory/
+cp /tmp/ATLAS-MemoryCore/openclaw-plugin/openclaw.plugin.json ~/.openclaw/hooks/atlas-memory/
 
 # 4. 复制配置模板
-cp /tmp/atlas-config-sync/setup/openclaw.template.json ~/.openclaw/openclaw.json
+cp /tmp/ATLAS-MemoryCore/setup/openclaw.template.json ~/.openclaw/openclaw.json
 ```
 
 ---
 
-## 四、填写配置
+## 六、填写配置
 
 编辑 `~/.openclaw/openclaw.json`，替换以下占位符：
 
-| 占位符 | 替换为 |
-|--------|--------|
-| `YOUR_DEEPSEEK_API_KEY` | DeepSeek API Key |
-| `YOUR_ANTHROPIC_API_KEY` | Anthropic API Key |
-| `YOUR_OMLX_API_KEY` | omlx API Key (本地服务密钥) |
-| `YOUR_TELEGRAM_USER_ID` | Telegram 用户 ID (可选) |
-| `~/.openclaw/workspace` | 实际工作区路径 |
-| `~/.openclaw/hooks` | 实际插件路径 |
+| 占位符 | 替换为 | 是否必须 |
+|--------|--------|---------|
+| `YOUR_DEEPSEEK_API_KEY` | DeepSeek API Key | 可选（distill回退omlx） |
+| `YOUR_ANTHROPIC_API_KEY` | Anthropic API Key | 按需 |
+| `YOUR_OMLX_API_KEY` | omlx 本地服务密钥 | 必须 |
+| `YOUR_TELEGRAM_BOT_TOKEN` | Telegram Bot Token | 可选 |
+| `YOUR_TELEGRAM_USER_ID` | Telegram 用户 ID | 可选 |
 
-> **注意**：`agents.defaults.model.fallbacks` 字段是合法的路由配置，不是模型定义字段。
-> 模型定义（`models.providers.*.models[]`）**不支持** `fallbacks` 字段。
+> **重要：** `agents.defaults.model.fallbacks` 是合法的路由配置字段。  
+> 模型定义（`models.providers.*.models[]`）**不支持** `fallbacks` 字段，否则启动失败。
 
 ---
 
-## 五、初始化 Qdrant Collection
+## 七、配置 DeepSeek API Key（可选）
 
-首次启动前手动创建 collection：
+DeepSeek API Key 需要在 OpenClaw gateway **启动前**设置为环境变量：
+
+```bash
+# 方式一：在启动脚本或 shell profile 中设置
+export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx
+
+# 方式二：在 ~/.openclaw/openclaw.json 的 env.vars 中添加
+# "DEEPSEEK_API_KEY": "sk-xxxxxxxxxxxxxxxx"
+```
+
+> ⚠️ OpenClaw 作为 LaunchAgent 运行时不继承 shell 环境变量，推荐使用方式二写入 openclaw.json。
+
+---
+
+## 八、初始化 Qdrant Collection
+
+首次启动前创建 collection（768维，如已存在可跳过）：
 
 ```bash
 curl -X PUT http://127.0.0.1:6333/collections/atlas_memories \
   -H 'Content-Type: application/json' \
   -d '{
-    "vectors": {
-      "size": 768,
-      "distance": "Cosine"
-    }
+    "vectors": { "size": 768, "distance": "Cosine" },
+    "on_disk_payload": true
   }'
 ```
 
 ---
 
-## 六、启动 OpenClaw
+## 九、启动 OpenClaw
 
 ```bash
 openclaw gateway start
 openclaw gateway status
 ```
 
-启动后验证 atlas-memory 插件加载：
+验证 atlas-memory 插件已加载并确认工具注册（应看到13个 atlas_* 工具）：
+
 ```bash
 openclaw gateway status --deep
-# 应看到 atlas-memory 在插件列表中
 ```
 
 ---
 
-## 七、已知配置陷阱
+## 十、已知配置陷阱
 
-### 7.1 上下文压缩死循环
-`compaction.reserveTokensFloor` 必须设为 **8000+**，否则压缩后剩余 token 不足，下一条消息立即触发再次压缩。
+### 10.1 上下文压缩死循环
+`compaction.reserveTokensFloor` 必须设为 **8000+**，否则压缩后剩余 token 不足，立即触发再次压缩。
 
-### 7.2 DeepSeek 上下文窗口
+### 10.2 DeepSeek 上下文窗口
 DeepSeek V4 Flash/Pro 的 `contextWindow` 必须设为 **1000000**（支持 1M context）。设为 65536 会导致频繁压缩。
 
-### 7.3 LaunchAgent 路径
-OpenClaw LaunchAgent plist 中的 `OPENCLAW_STATE_DIR`、`WorkingDirectory`、日志路径必须与实际安装目录一致。如果迁移了数据目录需同步修改：
-- `/Users/你的用户名/Library/LaunchAgents/ai.openclaw.gateway.plist`
-- `~/.openclaw/service-env/ai.openclaw.gateway.env`
+### 10.3 omlx thinking mode
+omlx Qwen3.5-9B 默认开启 thinking mode，导致每次调用约 60s。**在 omlx 配置中关闭 thinking mode**，降至 4s/call。
 
-### 7.4 Proxy 干扰 Qdrant
-macOS 系统代理（如 127.0.0.1:1082）可能拦截 Qdrant HTTP 请求。atlas-memory 使用 Node.js 原生 `http.request` 绕过代理，无需额外配置。
+### 10.4 Proxy 干扰本地服务
+macOS 系统代理（如 127.0.0.1:1082）可能拦截 Qdrant / Ollama / omlx 的 HTTP 请求。atlas-memory 使用 Node.js 原生 `http.request`，已绕过系统代理，无需额外配置。
 
-### 7.5 omlx thinking mode
-omlx Qwen3.5-9B 默认开启 thinking mode，导致每次调用约 60s。**在 omlx 配置中关闭 thinking mode**，降至 4s/call。无需在 prompt 中加 `/no_think`。
+### 10.5 LaunchAgent 环境变量
+OpenClaw 作为 LaunchAgent 运行时不继承 shell 的 `export` 变量。`DEEPSEEK_API_KEY`、`ATLAS_OBSIDIAN_VAULT` 等需写入 `openclaw.json` 的 `env.vars` 节，或在 `service-env/ai.openclaw.gateway.env` 中添加 `export` 语句。
+
+### 10.6 模型切换后向量失效
+切换嵌入模型（如从 nomic-embed-text 换为 mxbai-embed-large）后，已有记忆的向量维度不匹配，必须重建 collection 并重新导入（先 `atlas_export` 备份，再删除 collection，重建后 `atlas_import`）。
 
 ---
 
-## 八、可选：Obsidian Bridge
+## 十一、可选：Obsidian Bridge
 
-在 omlx 或系统环境变量中设置 vault 路径，atlas-memory 会每 6 小时自动导出记忆快照到 `Atlas_Mirror/` 目录：
+在 `openclaw.json` 的 `env.vars` 中设置 vault 路径：
 
-```bash
-# 在 ~/.zshrc 或 ~/.bash_profile 中
-export ATLAS_OBSIDIAN_VAULT="/path/to/your/obsidian/vault"
+```json
+"ATLAS_OBSIDIAN_VAULT": "/path/to/your/obsidian/vault"
 ```
 
-重启 OpenClaw 生效。Obsidian 中会出现：
-- `Atlas_Mirror/_index.md` — Dataview 仪表盘
-- `Atlas_Mirror/_evolution/YYYY-MM-DD.md` — 每日进化日志
+重启 OpenClaw 后，每 6 小时自动导出记忆快照到 vault 的 `Atlas_Mirror/` 目录：
+
+- `Atlas_Mirror/_index.md` — Dataview 仪表盘（需安装 Dataview 插件）
+- `Atlas_Mirror/_evolution/YYYY-MM-DD.md` — 每日进化日志（CAPTURE / DISTILL / FEEDBACK / PRUNE）
 - `Atlas_Mirror/[type] topic.md` — 按 memory_type + 标签聚类的记忆文件
 
-> ⚠️ Atlas_Mirror 是**只读镜像**。不要在 Obsidian 中直接编辑这些文件，编辑会在下次导出时被覆盖。
+> ⚠️ Atlas_Mirror 是**只读镜像**，下次导出会覆盖手动编辑内容。
 
 ---
 
-## 九、升级
+## 十二、升级到新版本
 
 ```bash
-cd /tmp && git clone https://github.com/luogangan7-lgtm/atlas-config-sync
-cp /tmp/atlas-config-sync/atlas-memory/index.js ~/.openclaw/hooks/atlas-memory/
-cp /tmp/atlas-config-sync/atlas-memory/openclaw.plugin.json ~/.openclaw/hooks/atlas-memory/
+cd /tmp/ATLAS-MemoryCore && git pull
+cp openclaw-plugin/index.js ~/.openclaw/hooks/atlas-memory/
 openclaw gateway restart
 ```
 
+升级 v9.4.0 → v9.5.0 注意事项：
+- 已有记忆（无 `status` / `feedback_score` 字段）自动兼容，INJECT/CAPTURE 正常工作
+- 新写入的记忆会携带 `status: 'active'` 和 `feedback_score: 1.0` 字段
+- `DEEPSEEK_API_KEY` 未配置时 distill 回退 omlx，无需额外操作
+
 ---
 
-## 十、atlas-memory 工具列表
+## 十三、工具速查
 
-| 工具 | 功能 |
-|------|------|
-| `atlas_store` | 手动存储记忆（含冲突检测 + 去重） |
-| `atlas_recall` | 语义搜索（时间衰减 + 访问计数 + memory_type 显示） |
-| `atlas_delete` | 按语义相似性删除 |
-| `atlas_stats` | 系统健康：Qdrant + Ollama + omlx + 缓存命中率 + 备份时间 |
-| `atlas_evolve` | 去重 + 过期清理（hit_count=0 + 90天 + low importance） |
-| `atlas_web_learn` | URL/文本分块学习（≤5块 × 1500字符），质量过滤 |
-| `atlas_merge` | 扫描 0.75-0.92 相似度，Qwen3.5 合并近重复为更丰富的事实 |
-| `atlas_export` | 全量导出到 `~/.atlas-backups/atlas-backup-YYYY-MM-DD.json` |
-| `atlas_import` | 从 JSON 备份恢复（100条/批次） |
-| `atlas_obsidian_sync` | 立即触发 Obsidian Bridge 导出 |
+| 工具 | 功能 | 模型 |
+|------|------|------|
+| `atlas_store` | 手动存储（含冲突检测去重） | omlx |
+| `atlas_recall` | 语义检索（时间衰减 + 访问计数） | Ollama embed |
+| `atlas_feedback` | 反馈评价（负评累积自动删除） | 无LLM |
+| `atlas_distill` | 知识提炼生成通则 | **DeepSeek**（omlx备用） |
+| `atlas_timeline` | 标签时间线查询 | 无LLM |
+| `atlas_evolve` | 手动触发去重+清理+自动提炼 | omlx / **DeepSeek** |
+| `atlas_merge` | 智能合并近重复记忆 | omlx |
+| `atlas_delete` | 按语义相似度删除 | Ollama embed |
+| `atlas_stats` | 记忆库完整状态 | 无LLM |
+| `atlas_web_learn` | URL/文本分块学习 | omlx |
+| `atlas_export` | 导出 JSON 备份 | 无LLM |
+| `atlas_import` | 从 JSON 备份恢复 | 无LLM |
+| `atlas_obsidian_sync` | 手动触发 Obsidian Bridge | 无LLM |
