@@ -1263,6 +1263,46 @@ async function migrateSchema(logger) {
   return { patched };
 }
 
+// ── 启动时还原动态域（防重启丢失）────────────────────────────────────────────
+async function restoreDynamicDomains(logger) {
+  // Scroll all points, collect distinct non-null domain values not in static DOMAIN_DIRS
+  const seen = new Set();
+  let offset = null;
+  do {
+    const body = { limit: 250, with_payload: true, with_vector: false,
+      filter: { must_not: [{ is_null: { key: 'domain' } }] } };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    for (const pt of r.body?.result?.points ?? []) {
+      const d = pt.payload?.domain;
+      if (d && !DOMAIN_DIRS[d]) seen.add(d);
+    }
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null);
+
+  if (!seen.size) return;
+
+  for (const domainName of seen) {
+    DOMAIN_DIRS[domainName] = domainName;
+    // Read description from _维度图谱.md if it exists
+    let desc = domainName;
+    if (OBSIDIAN_VAULT) {
+      const mapPath = join(OBSIDIAN_VAULT, domainName, '_维度图谱.md');
+      const raw = await readFile(mapPath, 'utf8').catch(() => null);
+      if (raw) {
+        const m = raw.match(/^description:\s*(.+)$/m);
+        if (m) desc = m[1].trim();
+      }
+    }
+    DOMAIN_DESCRIPTIONS[domainName] = desc;
+    // Pre-warm embedding cache
+    const vec = await embed(desc);
+    if (vec) domainEmbeddingCache.set(domainName, vec);
+    logger?.info?.(`[atlas-memory] 还原动态域: "${domainName}"`);
+  }
+}
+
 // ── v10 L0 原料统一摄入 ───────────────────────────────────────────────────────
 async function intakeToL0({ content, domain, topic, source = 'manual', tags = [], category = 'work', importance = 'medium', memory_type = 'fact', sessionKey }) {
   return writeQueue.push(WRITE_PRIORITY.CAPTURE, async () => {
@@ -1711,6 +1751,7 @@ export function register(api) {
 
   ensureCollection()
     .then(() => migrateSchema(logger))
+    .then(() => restoreDynamicDomains(logger))
     .catch(() => {});
   setInterval(() => runEvolution(logger).catch(() => {}), 24 * 60 * 60 * 1000);
   setInterval(() => backupCollection(logger).catch(() => {}), 7 * 24 * 60 * 60 * 1000);
