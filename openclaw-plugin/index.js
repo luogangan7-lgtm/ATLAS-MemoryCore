@@ -300,7 +300,7 @@ async function embed(text) {
 }
 
 // ── ★ omlx Qwen3.5-9B 推理（替代 Ollama 提取）───────────────────────────────
-async function omlxGenerate(systemMsg, userMsg, maxTokens = 800) {
+async function omlxGenerate(systemMsg, userMsg, maxTokens = 800, timeoutMs = EXTRACT_TIMEOUT_MS) {
   const r = await httpReq(
     `${OMLX}/v1/chat/completions`, 'POST',
     {
@@ -314,11 +314,12 @@ async function omlxGenerate(systemMsg, userMsg, maxTokens = 800) {
       stream:      false,
     },
     {},
-    EXTRACT_TIMEOUT_MS,
+    timeoutMs,
   );
   if (!r.ok) return null;
   return r.body?.choices?.[0]?.message?.content ?? null;
 }
+const AGENT_OMLX_TIMEOUT_MS = 90_000; // 后台Agent调用，允许更长等待
 
 // ── ★ DeepSeek 云端推理（用于 distill 等复杂合成，token 有限制）─────────────
 async function deepseekGenerate(systemMsg, userMsg, maxTokens = 400) {
@@ -1375,7 +1376,7 @@ async function extractL1Content(content, domain) {
   "applicable_scenarios": "这些知识适用的实际场景（1-2句）",
   "tags": ["标签1", "标签2", "标签3"]
 }`;
-  const out = await omlxGenerate(sys, user, 700);
+  const out = await omlxGenerate(sys, user, 700, AGENT_OMLX_TIMEOUT_MS);
   if (!out) return null;
   return parseJsonObject(out);
 }
