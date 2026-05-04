@@ -1,5 +1,5 @@
 /**
- * ATLAS Memory v10.0.0-phase1 — 自主演化知识系统（L0-L3 · WriteQueue · 6Agent · 鲜度衰减）
+ * ATLAS Memory v10.0.0-phase2 — 自主演化知识系统（L0-L3 · WriteQueue · CAPTURE/LEARN统一入口 · inferDecayRate）
  *
  * 架构（四层，商业级）：
  *   INJECT  — LRU缓存 + 跳过短/重复 + 时间衰减 + 访问计数 + 注入 memory_type
@@ -443,6 +443,21 @@ function applyTimeDecay(hits) {
     .sort((a, b) => b.effectiveScore - a.effectiveScore);
 }
 
+// ── v10 衰减速率推断 ──────────────────────────────────────────────────────────
+function inferDecayRate(domain, tags = []) {
+  const fastDomains = ['OKX交易'];
+  const fastKeywords = ['价格', '行情', '市场', '汇率', 'price', 'market', '报价'];
+  if (fastDomains.includes(domain)) return 'fast';
+  if (tags.some(t => fastKeywords.some(k => t.includes(k)))) return 'fast';
+
+  const slowDomains = ['战略', '情感学'];
+  const slowKeywords = ['原则', '规律', '方法论', '底层逻辑', '核心', '战略', '框架', '模型'];
+  if (slowDomains.includes(domain)) return 'slow';
+  if (tags.some(t => slowKeywords.some(k => t.includes(k)))) return 'slow';
+
+  return 'medium';
+}
+
 // ── 访问计数 + 自动升级 importance ────────────────────────────────────────────
 async function trackAccess(hits) {
   for (const h of hits) {
@@ -530,8 +545,11 @@ async function qdrantSearch(vector, { limit = 5, category, minScore = SCORE_MIN 
   }
   const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/search`, 'POST', body);
   if (!r.ok) return [];
-  // ★ 过滤负反馈记忆（feedback_score < FEEDBACK_FILTER_MIN，undefined 视为正常）
-  return (r.body?.result ?? []).filter(h => (h.payload?.feedback_score ?? 1.0) >= FEEDBACK_FILTER_MIN);
+  // ★ 过滤负反馈记忆 + 低鲜度记忆
+  return (r.body?.result ?? []).filter(h =>
+    (h.payload?.feedback_score  ?? 1.0) >= FEEDBACK_FILTER_MIN &&
+    (h.payload?.freshness_score ?? 1.0) >= FRESHNESS_INJECT_MIN
+  );
 }
 
 async function qdrantDelete(ids) {
@@ -588,20 +606,33 @@ async function _storeDistilled(tag, content, basis) {
   const vector = await embed(content);
   if (!vector) return null;
   await ensureCollection();
+  const now  = new Date().toISOString();
+  const tags = [tag, DISTILL_TAG];
   const payload = {
     content,
-    category:         'work',
-    importance:       'high',
-    tags:             [tag, DISTILL_TAG],
-    memory_type:      'skill',
-    created_at:       new Date().toISOString(),
-    source:           'distill',
-    session_key:      'system',
-    hit_count:        0,
-    last_accessed_at: null,
-    status:           'active',
-    feedback_score:   1.0,
-    distill_basis:    basis,
+    category:           'work',
+    importance:         'high',
+    tags,
+    memory_type:        'skill',
+    created_at:         now,
+    source:             'distill',
+    session_key:        'system',
+    hit_count:          0,
+    last_accessed_at:   null,
+    status:             'active',
+    feedback_score:     1.0,
+    distill_basis:      basis,
+    level:              LEVEL_WISDOM,
+    domain:             null,
+    topic:              tag,
+    freshness_score:    1.0,
+    decay_rate:         inferDecayRate(null, tags),
+    last_verified:      now,
+    source_ids:         [],
+    associated_ids:     [],
+    derived_to_id:      null,
+    obsidian_path:      null,
+    acquisition_source: 'distill',
   };
   const h = createHash('sha256').update(content.slice(0, 200)).digest('hex').slice(0, 16);
   distillWrittenHashes.add(h);
@@ -712,23 +743,34 @@ async function storeWithConflict({ content, category = 'work', importance = 'med
 
   await ensureCollection();
   const now     = new Date().toISOString();
+  const tagList = Array.isArray(tags) ? tags : [];
   const payload = {
-    content:          content.trim(),
+    content:            content.trim(),
     category,
     importance,
-    tags:             Array.isArray(tags) ? tags : [],
+    tags:               tagList,
     memory_type,
-    created_at:       now,
+    created_at:         now,
     source,
-    session_key:      sessionKey ?? 'unknown',
-    hit_count:        0,
-    last_accessed_at: null,
-    status:           'active',      // ★ 版本化
-    feedback_score:   1.0,           // ★ 反馈回路
+    session_key:        sessionKey ?? 'unknown',
+    hit_count:          0,
+    last_accessed_at:   null,
+    status:             'active',
+    feedback_score:     1.0,
+    level:              LEVEL_KNOWLEDGE,
+    domain:             null,
+    topic:              tagList[0] ?? category ?? 'general',
+    freshness_score:    1.0,
+    decay_rate:         inferDecayRate(null, tagList),
+    last_verified:      now,
+    source_ids:         [],
+    associated_ids:     [],
+    derived_to_id:      null,
+    obsidian_path:      null,
+    acquisition_source: source,
   };
   const result = await upsert(vector, payload);
   if (result.ok && supersededId) {
-    // ★ 版本链：补充 superseded_by 指向新版本
     await qdrantPatchPayload(supersededId, { superseded_by: result.id }).catch(() => {});
   }
   return result.ok ? { ok: true, id: result.id } : { ok: false, error: result.error || 'Qdrant 写入失败' };
@@ -739,11 +781,12 @@ async function storeMemory(params) {
   return storeWithConflict({ ...params, doConflictCheck: true });
 }
 
-// ── ⑥ 批量存储（并行 embed + 单次 batch upsert）──────────────────────────────
+// ── ⑥ 批量存储（并行 embed → 逐条 intakeToL0，统一 L0 入口）──────────────────
 async function batchStoreMemories(facts, source, sessionKey, doConflictCheck = false) {
   if (!facts.length) return { stored: 0, deduplicated: 0, skipped: 0 };
   await ensureCollection();
 
+  // 并行 embed（保持性能）
   const embedded = await Promise.all(
     facts.map(async f => {
       const vector = await embed(f.content);
@@ -751,21 +794,20 @@ async function batchStoreMemories(facts, source, sessionKey, doConflictCheck = f
     })
   );
   const valid = embedded.filter(Boolean);
-  const points  = [];
-  let deduplicated = 0;
-  let skipped      = 0;
+  let stored = 0, deduplicated = 0, skipped = 0;
 
   for (const { f, vector } of valid) {
-    // ★ 跳过 distill 刚写入的内容（防 CAPTURE 二次捕获）
+    // 跳过 distill 刚写入的内容（防 CAPTURE 二次捕获）
     const ch = createHash('sha256').update(f.content.trim().slice(0, 200)).digest('hex').slice(0, 16);
     if (distillWrittenHashes.has(ch)) { deduplicated++; continue; }
     // 精确去重
     const dup = await qdrantSearch(vector, { limit: 1, minScore: SCORE_DEDUP });
     if (dup.length) { deduplicated++; continue; }
 
-    // ★ 冲突检测（medium+ 重要性且启用时）
-    let content     = f.content.trim();
-    const importance = f.importance ?? 'work';
+    // 冲突检测（medium+ 重要性）
+    let content      = f.content.trim();
+    const importance = f.importance ?? 'medium';
+    let supersededId = null;
     if (doConflictCheck && IMPORTANCE_LEVELS.indexOf(importance) >= 1) {
       const candidates = await qdrantSearch(vector, { limit: 3, minScore: SCORE_CONFLICT_MIN });
       const conflicts  = candidates.filter(c => c.score < SCORE_DEDUP);
@@ -775,41 +817,40 @@ async function batchStoreMemories(facts, source, sessionKey, doConflictCheck = f
           const cidx       = (res.conflict_index ?? 1) - 1;
           const conflictId = conflicts[Math.max(0, Math.min(cidx, conflicts.length - 1))]?.id;
           if (res.action === 'keep_old') { skipped++; continue; }
-          if (res.action === 'keep_new' && conflictId) await qdrantDelete([conflictId]);
-          if (res.action === 'merge' && res.merged_content?.trim() && conflictId) {
-            await qdrantDelete([conflictId]);
-            content = res.merged_content.trim();
+          if ((res.action === 'keep_new' || res.action === 'merge') && conflictId) {
+            supersededId = conflictId;
+            await qdrantPatchPayload(conflictId, { status: 'superseded', superseded_at: new Date().toISOString() });
           }
+          if (res.action === 'merge' && res.merged_content?.trim()) content = res.merged_content.trim();
         }
       }
     }
 
-    const now = new Date().toISOString();
-    const id  = stableId(content + now);
-    points.push({
-      id, vector,
-      payload: {
-        content,
-        category:         f.category    ?? 'work',
-        importance:       f.importance  ?? 'medium',
-        tags:             Array.isArray(f.tags) ? f.tags : [],
-        memory_type:      f.memory_type ?? 'fact',
-        created_at:       now,
-        source,
-        session_key:      sessionKey ?? 'unknown',
-        hit_count:        0,
-        last_accessed_at: null,
-        status:           'active',   // ★ 版本化
-        feedback_score:   1.0,        // ★ 反馈回路
-      },
+    // ★ v10 统一入口：Obsidian L0 + Qdrant（含 level/domain/freshness_score/decay_rate）
+    const result = await intakeToL0({
+      content,
+      domain:      null,            // Phase 4 域检测Agent 自动填充
+      topic:       f.tags?.[0] ?? f.category ?? 'general',
+      source,
+      tags:        Array.isArray(f.tags) ? f.tags : [],
+      category:    f.category   ?? 'work',
+      importance,
+      memory_type: f.memory_type ?? 'fact',
+      sessionKey,
     });
+
+    if (result?.ok) {
+      stored++;
+      if (supersededId && result.id) {
+        await qdrantPatchPayload(supersededId, { superseded_by: result.id }).catch(() => {});
+      }
+    }
   }
 
-  if (points.length > 0) {
-    await httpReq(`${QDRANT}/collections/${COLLECTION}/points?wait=true`, 'PUT', { points });
-    appendEvolutionLog('CAPTURE', `+${points.length} 条记忆（${source}，去重${deduplicated}，冲突跳过${skipped}）`).catch(() => {});
+  if (stored > 0) {
+    appendEvolutionLog('CAPTURE', `+${stored} 条记忆（${source}，去重${deduplicated}，冲突跳过${skipped}）`).catch(() => {});
   }
-  return { stored: points.length, deduplicated, skipped };
+  return { stored, deduplicated, skipped };
 }
 
 // ── 后台进化：去重 + ★ 过期清理 ──────────────────────────────────────────────
@@ -1208,7 +1249,7 @@ async function migrateSchema(logger) {
 }
 
 // ── v10 L0 原料统一摄入 ───────────────────────────────────────────────────────
-async function intakeToL0({ content, domain, topic, source = 'manual', tags = [], category = 'work', sessionKey }) {
+async function intakeToL0({ content, domain, topic, source = 'manual', tags = [], category = 'work', importance = 'medium', memory_type = 'fact', sessionKey }) {
   return writeQueue.push(WRITE_PRIORITY.CAPTURE, async () => {
     const domainDir = DOMAIN_DIRS[domain] ?? null;
     const level0Dir = OBSIDIAN_VAULT
@@ -1221,7 +1262,21 @@ async function intakeToL0({ content, domain, topic, source = 'manual', tags = []
 
     if (level0Dir) {
       await mkdir(level0Dir, { recursive: true });
-      const md = `---\nlevel: L0\ndomain: ${domain ?? '未分类'}\ntopic: ${topic ?? ''}\nsource: ${source}\ncreated: ${new Date().toISOString()}\ntags: [${tags.map(t => `"${t}"`).join(', ')}]\n---\n\n${content}\n`;
+      const md = [
+        '---',
+        `level: L0`,
+        `domain: ${domain ?? '未分类'}`,
+        `topic: ${topic ?? ''}`,
+        `source: ${source}`,
+        `importance: ${importance}`,
+        `memory_type: ${memory_type}`,
+        `created: ${new Date().toISOString()}`,
+        `tags: [${tags.map(t => `"${t}"`).join(', ')}]`,
+        '---',
+        '',
+        content,
+        '',
+      ].join('\n');
       await writeFile(join(level0Dir, filename), md, 'utf8');
       obsidianPath = domainDir ? `${domainDir}/L0-原料/${filename}` : `_未分类/${filename}`;
     }
@@ -1230,29 +1285,30 @@ async function intakeToL0({ content, domain, topic, source = 'manual', tags = []
     if (!vector) return { ok: false, error: 'embed failed' };
     await ensureCollection();
     const now = new Date().toISOString();
+    const decay_rate = inferDecayRate(domain, tags);
     const payload = {
-      content:           content.trim(),
+      content:            content.trim(),
       category,
-      importance:        'medium',
-      tags:              Array.isArray(tags) ? tags : [],
-      memory_type:       'fact',
-      created_at:        now,
+      importance,
+      tags:               Array.isArray(tags) ? tags : [],
+      memory_type,
+      created_at:         now,
       source,
-      session_key:       sessionKey ?? 'manual',
-      hit_count:         0,
-      last_accessed_at:  null,
-      status:            'active',
-      feedback_score:    1.0,
-      level:             LEVEL_RAW,
-      domain:            domain ?? null,
-      topic:             topic ?? tags[0] ?? category,
-      freshness_score:   1.0,
-      decay_rate:        'medium',
-      last_verified:     now,
-      source_ids:        [],
-      associated_ids:    [],
-      derived_to_id:     null,
-      obsidian_path:     obsidianPath,
+      session_key:        sessionKey ?? 'manual',
+      hit_count:          0,
+      last_accessed_at:   null,
+      status:             'active',
+      feedback_score:     1.0,
+      level:              LEVEL_RAW,
+      domain:             domain ?? null,
+      topic:              topic ?? tags[0] ?? category,
+      freshness_score:    1.0,
+      decay_rate,
+      last_verified:      now,
+      source_ids:         [],
+      associated_ids:     [],
+      derived_to_id:      null,
+      obsidian_path:      obsidianPath,
       acquisition_source: source,
     };
     return upsert(vector, payload);
@@ -1266,7 +1322,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase1 — 自主演化知识系统（L0-L3四层 · WriteQueue并发安全 · 6Agent架构 · 鲜度衰减 · MCP就绪）';
+export const description = 'ATLAS Memory v10.0.0-phase2 — 自主演化知识系统（L0-L3四层 · CAPTURE/LEARN统一L0入口 · inferDecayRate · freshness过滤）';
 
 export function register(api) {
   const logger = api.logger;
