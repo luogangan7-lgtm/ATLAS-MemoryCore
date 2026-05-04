@@ -2127,6 +2127,184 @@ async function runSynthesizeAgent(logger) {
   return { l2_scanned: l2Nodes.length, clusters: totalClusters, synthesized };
 }
 
+// ── Phase 7：Meta-Agent ───────────────────────────────────────────────────────
+
+// Tavily 搜索（本地代理或云端）
+const TAVILY_URL     = (process.env.TAVILY_BASE_URL ?? 'https://api.tavily.com').replace(/\/$/, '');
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY ?? '';
+
+async function tavilySearch(query, maxResults = 3) {
+  if (!TAVILY_API_KEY) return [];
+  const r = await httpReq(`${TAVILY_URL}/search`, 'POST', {
+    api_key: TAVILY_API_KEY,
+    query,
+    search_depth: 'basic',
+    max_results: maxResults,
+  }, {}, 15_000);
+  if (!r.ok) return [];
+  return (r.body?.results ?? []).map(item => ({
+    title:   item.title ?? '',
+    url:     item.url   ?? '',
+    content: item.content ?? item.raw_content ?? '',
+  }));
+}
+
+function calcFreshness(createdAt, lastVerified, decayRate) {
+  const halfLifeDays = DECAY_HALF_LIFE[decayRate] ?? DECAY_HALF_LIFE.medium;
+  const ref  = lastVerified ?? createdAt;
+  const days = (Date.now() - new Date(ref).getTime()) / 86_400_000;
+  return Math.max(0, Math.pow(0.5, days / halfLifeDays));
+}
+
+async function runFreshnessUpdate(logger) {
+  let offset = null;
+  let updated = 0;
+  let stale   = 0;
+  do {
+    const body = { limit: 250, with_payload: true, with_vector: false };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    const pts = r.body?.result?.points ?? [];
+    for (const pt of pts) {
+      const p = pt.payload ?? {};
+      if (p.status === 'superseded') continue;
+      const fresh = calcFreshness(p.created_at, p.last_verified, p.decay_rate ?? 'medium');
+      const delta = Math.abs(fresh - (p.freshness_score ?? 1.0));
+      if (delta < 0.01) continue; // skip trivial updates
+      await writeQueue.push(WRITE_PRIORITY.AGENT, () =>
+        qdrantPatchPayload(pt.id, { freshness_score: parseFloat(fresh.toFixed(4)) })
+      );
+      updated++;
+      if (fresh < FRESHNESS_REFRESH) stale++;
+    }
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null);
+  logger?.info?.(`[atlas-memory] Meta-Agent 新鲜度: 更新${updated}条, 过期${stale}条`);
+  return { updated, stale };
+}
+
+async function buildAcquisitionPlan(domainStats) {
+  // domainStats: [{domain, l0, l1, l2, l3, staleFraction}]
+  const summary = domainStats
+    .map(d => `${d.domain}: L0=${d.l0} L1=${d.l1} L2=${d.l2} L3=${d.l3} 过期比=${(d.staleFraction*100).toFixed(0)}%`)
+    .join('\n');
+  const sys = '你是知识采集规划师。严格输出JSON数组，不要解释，不要markdown代码块。';
+  const user =
+    `当前知识库各域状态：\n${summary}\n\n` +
+    `请为知识薄弱（L1<5）或过期比高（>30%）的域各生成1-2条搜索查询（中文或英文均可），` +
+    `输出：[{"domain":"域名","query":"搜索词","reason":"一句话理由"}]。最多返回6条。`;
+  const raw = await deepseekGenerate(sys, user, 400);
+  if (!raw) return [];
+  try {
+    const cleaned = raw.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
+    const arr = JSON.parse(cleaned);
+    return Array.isArray(arr) ? arr.filter(x => x.domain && x.query).slice(0, 6) : [];
+  } catch { return []; }
+}
+
+async function runDailyAcquisition(plan, logger) {
+  let acquired = 0;
+  for (const item of plan) {
+    const results = await tavilySearch(item.query, 3);
+    for (const res of results) {
+      if (!res.content || res.content.length < 100) continue;
+      const content = `${res.title ? res.title + '。' : ''}${res.content}`.slice(0, 800);
+      await batchStoreMemories(
+        [{ content, category: 'work', importance: 'medium', memory_type: 'fact',
+           tags: [item.domain, 'auto-acquired'], quality: 7 }],
+        `meta-agent:${res.url || item.query}`,
+        undefined,
+        false,
+      );
+      acquired++;
+    }
+  }
+  return acquired;
+}
+
+async function writeDailyReport(date, stats) {
+  if (!OBSIDIAN_VAULT) return;
+  const dir = join(OBSIDIAN_VAULT, '_系统', '日报');
+  await mkdir(dir, { recursive: true });
+  const filename = `${date}.md`;
+  const planLines = (stats.plan ?? []).map(p => `- [${p.domain}] ${p.query} — ${p.reason ?? ''}`).join('\n');
+  const md = [
+    '---',
+    `date: ${date}`,
+    `type: daily-report`,
+    `generated: ${new Date().toISOString()}`,
+    '---',
+    '',
+    `# ATLAS 日报 ${date}`,
+    '',
+    '## 新鲜度更新',
+    `- 更新节点: ${stats.freshness?.updated ?? 0}`,
+    `- 过期节点: ${stats.freshness?.stale ?? 0}`,
+    '',
+    '## 知识库规模',
+    ...Object.entries(stats.domainStats ?? {}).map(([d, s]) =>
+      `- **${d}**: L0=${s.l0} L1=${s.l1} L2=${s.l2} L3=${s.l3}`),
+    '',
+    '## 今日采集计划',
+    planLines || '（无需补充）',
+    '',
+    `## 自动采集结果`,
+    `- 新增 L0 记录: ${stats.acquired ?? 0} 条`,
+  ].join('\n');
+  await writeFile(join(dir, filename), md, 'utf8');
+}
+
+async function runMetaAgent(logger) {
+  const date = new Date().toISOString().slice(0, 10);
+
+  // 1. 新鲜度批量更新
+  const freshness = await runFreshnessUpdate(logger);
+
+  // 2. 统计各域节点分布
+  const levelCountByDomain = {};
+  let offset = null;
+  do {
+    const body = { limit: 500, with_payload: true, with_vector: false,
+      filter: { must_not: [{ key: 'status', match: { value: 'superseded' } }] } };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    for (const pt of r.body?.result?.points ?? []) {
+      const d = pt.payload?.domain ?? '未分类';
+      if (!levelCountByDomain[d]) levelCountByDomain[d] = { l0:0, l1:0, l2:0, l3:0, staleCount:0, total:0 };
+      const lvl = pt.payload?.level ?? 0;
+      const key = ['l0','l1','l2','l3'][lvl] ?? 'l0';
+      levelCountByDomain[d][key]++;
+      levelCountByDomain[d].total++;
+      if ((pt.payload?.freshness_score ?? 1.0) < FRESHNESS_REFRESH) levelCountByDomain[d].staleCount++;
+    }
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null);
+
+  const domainStats = Object.entries(levelCountByDomain).map(([domain, s]) => ({
+    domain, l0: s.l0, l1: s.l1, l2: s.l2, l3: s.l3,
+    staleFraction: s.total ? s.staleCount / s.total : 0,
+  }));
+
+  // 3. 生成采集计划
+  const plan = await buildAcquisitionPlan(domainStats);
+  logger?.info?.(`[atlas-memory] Meta-Agent 采集计划: ${plan.length}条`);
+
+  // 4. 执行 web search → intakeToL0
+  const acquired = await runDailyAcquisition(plan, logger);
+  logger?.info?.(`[atlas-memory] Meta-Agent 采集: 新增${acquired}条L0`);
+
+  // 5. 写日报到 Obsidian（agent 下次对话自然注入）
+  await writeDailyReport(date, { freshness, domainStats: levelCountByDomain, plan, acquired });
+
+  appendEvolutionLog('META',
+    `日报: 新鲜度更新${freshness.updated}条, 过期${freshness.stale}条, 采集${acquired}条`
+  ).catch(() => {});
+
+  return { date, freshness, domains: domainStats.length, planItems: plan.length, acquired };
+}
+
 // ── 工具结果格式 ──────────────────────────────────────────────────────────────
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -2134,7 +2312,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase6 — 自主演化知识系统（L0-L3四层 · 整理/域检测/关联/合成Agent · L2聚类→L3版本化框架 · DeepSeek合成 · atlas_organize · atlas_domain_detect · atlas_associate · atlas_synthesize）';
+export const description = 'ATLAS Memory v10.0.0-phase7 — 自主演化知识系统（L0-L3四层 · 5Agent全自治 · 新鲜度衰减 · 自动采集 · Obsidian日报 · INJECT自然浮现 · atlas_organize/domain_detect/associate/synthesize/meta）';
 
 export function register(api) {
   const logger = api.logger;
@@ -2157,6 +2335,9 @@ export function register(api) {
   // Phase 6：合成Agent（12h 周期 + 启动后 90s 首次触发）
   setInterval(() => runAgent('synthesize', () => runSynthesizeAgent(logger)).catch(() => {}), SYNTHESIZE_INTERVAL_MS);
   setTimeout(() => runAgent('synthesize', () => runSynthesizeAgent(logger)).catch(() => {}), 90_000);
+  // Phase 7：Meta-Agent（24h 周期 + 启动后 120s 首次触发）
+  setInterval(() => runAgent('meta', () => runMetaAgent(logger)).catch(() => {}), META_INTERVAL_MS);
+  setTimeout(() => runAgent('meta', () => runMetaAgent(logger)).catch(() => {}), 120_000);
 
   // Obsidian Bridge：每 6 小时自动刷新监控台
   if (OBSIDIAN_VAULT) {
@@ -2507,6 +2688,24 @@ export function register(api) {
         if (agentLocks.get('synthesize')) return jsonResult({ ok: false, reason: '合成Agent正在运行，请稍后重试' });
         const result = await new Promise((resolve, reject) => {
           runAgent('synthesize', () => runSynthesizeAgent(logger)).then(resolve).catch(reject);
+        });
+        return jsonResult({ ok: true, ...(result ?? {}) });
+      } catch (e) {
+        return jsonResult({ error: e.message });
+      }
+    },
+  }));
+
+  // atlas_meta（Phase 7）
+  api.registerTool(() => ({
+    name: 'atlas_meta',
+    description: '手动触发Meta-Agent：批量更新新鲜度衰减、统计各域知识分布、DeepSeek生成采集计划、执行web搜索补充L0、写日报到Obsidian _系统/日报/。',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      try {
+        if (agentLocks.get('meta')) return jsonResult({ ok: false, reason: 'Meta-Agent正在运行，请稍后重试' });
+        const result = await new Promise((resolve, reject) => {
+          runAgent('meta', () => runMetaAgent(logger)).then(resolve).catch(reject);
         });
         return jsonResult({ ok: true, ...(result ?? {}) });
       } catch (e) {
