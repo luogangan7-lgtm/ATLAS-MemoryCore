@@ -1,8 +1,8 @@
 {
   "id": "atlas-memory",
   "name": "ATLAS Memory",
-  "version": "9.4.0",
-  "description": "商业级语义记忆系统 — Qdrant + Ollama nomic-embed + omlx Qwen3.5 冲突检测 + 质量过滤 + memory_type + Obsidian Bridge",
+  "version": "10.0.0-phase9",
+  "description": "自主演化知识系统 v10 — L0-L3四层 · 5Agent全自治（整理/域检测/关联/合成/Meta） · INJECT层级优先 · 新鲜度衰减 · 分层Obsidian导出 · Git同步",
   "main": "index.js",
   "author": "ATLAS Team",
   "license": "MIT",

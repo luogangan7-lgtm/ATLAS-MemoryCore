@@ -1,5 +1,5 @@
 /**
- * ATLAS Memory v10.0.0-phase3 — 自主演化知识系统（L0-L3 · 整理Agent · 域向量匹配 · L1 Obsidian写入）
+ * ATLAS Memory v10.0.0-phase9 — 自主演化知识系统（L0-L3 · 整理Agent · 域向量匹配 · L1 Obsidian写入）
  *
  * 架构（四层，商业级）：
  *   INJECT  — LRU缓存 + 跳过短/重复 + 时间衰减 + 访问计数 + 注入 memory_type
@@ -1268,6 +1268,143 @@ if (logs.length === 0) {
   await writeFile(join(mirrorDir, '_index.md'), content, 'utf8');
 }
 
+// ── Phase 9：Obsidian 分层导出 + Git push ─────────────────────────────────────
+
+async function gitPushVault(logger) {
+  if (!OBSIDIAN_VAULT || !GITHUB_REPO) return { ok: false, reason: 'vault 或 GITHUB_REPO 未配置' };
+  const { exec } = await import('child_process');
+  const run = (cmd) => new Promise((resolve) => {
+    exec(cmd, { cwd: OBSIDIAN_VAULT, timeout: 30_000 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: stdout?.trim(), stderr: stderr?.trim() });
+    });
+  });
+  await run('git add -A');
+  const date = new Date().toISOString().slice(0, 16).replace('T', ' ');
+  const commit = await run(`git commit -m "atlas: auto-export ${date}" --allow-empty`);
+  const push   = await run('git push origin main --quiet');
+  if (!push.ok) logger?.warn?.(`[atlas-memory] git push 失败: ${push.stderr}`);
+  return { ok: push.ok, committed: commit.stdout };
+}
+
+async function writeDomainIndex(domain, stats) {
+  if (!OBSIDIAN_VAULT) return;
+  const domainDir = DOMAIN_DIRS[domain] ?? domain;
+  const dir = join(OBSIDIAN_VAULT, domainDir);
+  await mkdir(dir, { recursive: true });
+  const now = new Date().toISOString();
+  const md = [
+    '---',
+    `domain: ${domain}`,
+    `last_export: ${now}`,
+    '---',
+    '',
+    `# ${domain} · 知识索引`,
+    '',
+    '```dataview',
+    'TABLE level, topic, freshness_score as 新鲜度, created as 创建',
+    `FROM "${domainDir}"`,
+    'WHERE level != null',
+    'SORT level DESC, freshness_score DESC',
+    '```',
+    '',
+    '## 层级分布',
+    `- L0 原料：${stats.l0} 条`,
+    `- L1 知识：${stats.l1} 条`,
+    `- L2 洞见：${stats.l2} 条`,
+    `- L3 智识：${stats.l3} 条`,
+    '',
+    '## 子目录',
+    `- [[${domainDir}/L0-原料]]`,
+    `- [[${domainDir}/L1-知识]]`,
+    `- [[${domainDir}/L2-关联]]`,
+    `- [[${domainDir}/L3-智识]]`,
+  ].join('\n');
+  await writeFile(join(dir, '_index.md'), md, 'utf8');
+}
+
+async function writeDomainMap(domainStats) {
+  if (!OBSIDIAN_VAULT) return;
+  const dir = join(OBSIDIAN_VAULT, '_系统');
+  await mkdir(dir, { recursive: true });
+  const now   = new Date().toISOString();
+  const rows  = domainStats
+    .sort((a, b) => (b.l1 + b.l2 + b.l3) - (a.l1 + a.l2 + a.l3))
+    .map(d => `| [[${DOMAIN_DIRS[d.domain] ?? d.domain}/_index\\|${d.domain}]] | ${d.l0} | ${d.l1} | ${d.l2} | ${d.l3} | ${((1 - (d.staleFraction ?? 0)) * 100).toFixed(0)}% |`)
+    .join('\n');
+  const md = [
+    '---',
+    `last_export: ${now}`,
+    `type: domain-map`,
+    '---',
+    '',
+    '# ATLAS 域图谱',
+    `> 最后更新：${now.slice(0, 16).replace('T', ' ')}`,
+    '',
+    '| 域 | L0 | L1 | L2 | L3 | 新鲜度 |',
+    '|---|---|---|---|---|---|',
+    rows,
+    '',
+    '## 域连接图',
+    ...domainStats.map(d => `- [[${DOMAIN_DIRS[d.domain] ?? d.domain}/_index|${d.domain}]]`),
+  ].join('\n');
+  await writeFile(join(dir, '域图谱.md'), md, 'utf8');
+}
+
+async function runLayeredExport(logger) {
+  if (!OBSIDIAN_VAULT) return { ok: false, reason: 'ATLAS_OBSIDIAN_VAULT 未配置' };
+
+  // 1. 拉取全量节点
+  const allPoints = [];
+  let offset = null;
+  do {
+    const body = { limit: 250, with_payload: true, with_vector: false,
+      filter: { must_not: [{ key: 'status', match: { value: 'superseded' } }] } };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    allPoints.push(...(r.body?.result?.points ?? []));
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null);
+
+  if (!allPoints.length) return { ok: true, domains: 0, files: 0 };
+
+  // 2. 按域统计
+  const byDomain = new Map();
+  for (const pt of allPoints) {
+    const d = pt.payload?.domain ?? '未分类';
+    if (!byDomain.has(d)) byDomain.set(d, { l0:0, l1:0, l2:0, l3:0, staleFraction:0, staleCount:0, total:0 });
+    const s = byDomain.get(d);
+    const lvl = pt.payload?.level ?? 0;
+    ['l0','l1','l2','l3'][lvl] && (s[['l0','l1','l2','l3'][lvl]]++);
+    s.total++;
+    if ((pt.payload?.freshness_score ?? 1.0) < FRESHNESS_REFRESH) s.staleCount++;
+  }
+  for (const [, s] of byDomain) s.staleFraction = s.total ? s.staleCount / s.total : 0;
+
+  // 3. 为每个域写 _index.md
+  const domainStats = [];
+  for (const [domain, stats] of byDomain) {
+    await writeDomainIndex(domain, stats).catch(() => {});
+    domainStats.push({ domain, ...stats });
+  }
+
+  // 4. 写全局域图谱
+  await writeDomainMap(domainStats).catch(() => {});
+
+  // 5. 保留旧版 Atlas_Mirror（标注已过时）
+  const legacyNote = join(OBSIDIAN_VAULT, OBSIDIAN_MIRROR_DIR, '_DEPRECATED.md');
+  await writeFile(legacyNote,
+    '---\ntype: deprecated\n---\n\n> [!warning] 旧版导出（Atlas_Mirror）已停用\n> 请查看各域目录下的 `_index.md` 和 `_系统/域图谱.md`\n',
+    'utf8'
+  ).catch(() => {});
+
+  // 6. Git push
+  const pushResult = await gitPushVault(logger);
+  logger?.info?.(`[atlas-memory] 分层导出: ${domainStats.length}域, git=${pushResult.ok}`);
+
+  return { ok: true, domains: domainStats.length, files: domainStats.length + 1, pushed: pushResult.ok };
+}
+
 // ── Obsidian Bridge：每日进化日志 ─────────────────────────────────────────────
 async function appendEvolutionLog(type, message) {
   if (!OBSIDIAN_VAULT) return;
@@ -2372,7 +2509,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase8 — 自主演化知识系统（L0-L3四层 · 5Agent全自治 · INJECT层级优先L3→L1 · 新鲜度过滤 · Obsidian源文件读取 · 自动采集 · 6工具）';
+export const description = 'ATLAS Memory v10.0.0-phase9 — 自主演化知识系统（L0-L3四层 · 5Agent全自治 · INJECT层级优先L3→L1 · 新鲜度过滤 · Obsidian源文件读取 · 自动采集 · 分层Obsidian导出 · Git同步）';
 
 export function register(api) {
   const logger = api.logger;
@@ -2399,13 +2536,11 @@ export function register(api) {
   setInterval(() => runAgent('meta', () => runMetaAgent(logger)).catch(() => {}), META_INTERVAL_MS);
   setTimeout(() => runAgent('meta', () => runMetaAgent(logger)).catch(() => {}), 120_000);
 
-  // Obsidian Bridge：每 6 小时自动刷新监控台
+  // Obsidian Bridge：每 6 小时分层导出 + Git push（Phase 9）
   if (OBSIDIAN_VAULT) {
     logger?.info?.(`[atlas-memory] Obsidian Bridge 启动，vault: ${OBSIDIAN_VAULT}`);
-    setInterval(async () => {
-      await runMirrorExport(logger).catch(() => {});
-      await writeIndexDashboard().catch(() => {});
-    }, MIRROR_EXPORT_INTERVAL);
+    setInterval(() => runLayeredExport(logger).catch(() => {}), MIRROR_EXPORT_INTERVAL);
+    setTimeout(() => runLayeredExport(logger).catch(() => {}), 15_000);
   }
 
   // ══════════════════════════════════════════════════════════════════════════════
@@ -2976,43 +3111,19 @@ ${content}
     },
   }));
 
-  // ★ atlas_obsidian_sync — Obsidian Bridge 手动同步
+  // atlas_obsidian_sync — Phase 9：分层导出 + Git push
   api.registerTool(() => ({
     name: 'atlas_obsidian_sync',
     description:
-      '手动触发 Obsidian Bridge 全量同步：①按 memory_type+主标签重建聚类文件（全量覆写）；' +
-      '②刷新 _index.md 仪表盘；③写入本次同步进化日志。' +
-      '需配置环境变量 ATLAS_OBSIDIAN_VAULT=/path/to/vault。',
-    parameters: {
-      type: 'object',
-      properties: {
-        export_only: { type: 'boolean', description: '只重建聚类文件，不刷新仪表盘', default: false },
-      },
-    },
-    execute: async (_callId, params) => {
-      if (!OBSIDIAN_VAULT) {
-        return jsonResult({
-          error: 'ATLAS_OBSIDIAN_VAULT 环境变量未配置',
-          hint:  '在 OpenClaw 配置或系统环境中设置 ATLAS_OBSIDIAN_VAULT=/path/to/your/obsidian/vault',
-        });
-      }
-      const { export_only = false } = params ?? {};
+      '手动触发 Obsidian 分层导出（Phase 9）：①各域 _index.md（Dataview）；' +
+      '②_系统/域图谱.md 全局汇总；③Git commit+push 到 knowledge-base 仓库。',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      if (!OBSIDIAN_VAULT) return jsonResult({ error: 'ATLAS_OBSIDIAN_VAULT 未配置' });
       try {
-        const exportResult = await runMirrorExport(logger);
-        if (!export_only) await writeIndexDashboard();
-        await appendEvolutionLog(
-          'SYNC',
-          `手动同步完成：${exportResult.clusters} 个主题聚类（${exportResult.total} 条记忆）→ ${exportResult.dir}`,
-        );
-        return jsonResult({
-          ok:           true,
-          vault:        OBSIDIAN_VAULT,
-          mirror_dir:   exportResult.dir,
-          clusters:     exportResult.clusters,
-          total:        exportResult.total,
-          files_written: exportResult.written,
-          dashboard:    !export_only,
-        });
+        const result = await runLayeredExport(logger);
+        await appendEvolutionLog('SYNC', `分层导出: ${result.domains}域, git=${result.pushed}`);
+        return jsonResult({ ok: true, vault: OBSIDIAN_VAULT, ...result });
       } catch (e) {
         return jsonResult({ error: e.message });
       }
