@@ -1,18 +1,30 @@
 {
   "id": "atlas-memory",
   "name": "ATLAS Memory",
-  "version": "10.0.0-phase9",
-  "description": "自主演化知识系统 v10 — L0-L3四层 · 5Agent全自治（整理/域检测/关联/合成/Meta） · INJECT层级优先 · 新鲜度衰减 · 分层Obsidian导出 · Git同步",
+  "version": "10.0.0-phase10",
+  "description": "自主演化知识系统 v10 — L0-L3四层 · 5Agent全自治 · INJECT层级优先 · 新鲜度衰减 · 分层Obsidian导出 · Git同步 · MCP Server(port 8765)",
   "main": "index.js",
   "author": "ATLAS Team",
   "license": "MIT",
   "configSchema": {
     "type": "object",
     "properties": {
-      "qdrant_url": { "type": "string", "description": "Qdrant HTTP URL，默认 http://127.0.0.1:6333" },
-      "collection": { "type": "string", "description": "Qdrant collection 名，默认 atlas_memories" },
-      "ollama_url": { "type": "string", "description": "Ollama HTTP URL，默认 http://127.0.0.1:11434" },
-      "embed_model": { "type": "string", "description": "嵌入模型，默认 nomic-embed-text:latest" }
+      "qdrant_url": {
+        "type": "string",
+        "description": "Qdrant HTTP URL，默认 http://127.0.0.1:6333"
+      },
+      "collection": {
+        "type": "string",
+        "description": "Qdrant collection 名，默认 atlas_memories"
+      },
+      "ollama_url": {
+        "type": "string",
+        "description": "Ollama HTTP URL，默认 http://127.0.0.1:11434"
+      },
+      "embed_model": {
+        "type": "string",
+        "description": "嵌入模型，默认 nomic-embed-text:latest"
+      }
     }
   }
 }

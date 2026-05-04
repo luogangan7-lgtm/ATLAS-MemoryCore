@@ -2507,12 +2507,251 @@ function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
 }
 
+// ── Phase 10: MCP Server ──────────────────────────────────────────────────────
+
+async function getLevelStats() {
+  const counts = { 0: 0, 1: 0, 2: 0, 3: 0 };
+  let offset = null;
+  do {
+    const body = { limit: 256, with_payload: true, with_vector: false,
+      filter: { must_not: [{ key: 'status', match: { value: 'superseded' } }] } };
+    if (offset) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    for (const p of r.body?.result?.points ?? []) {
+      const lv = p.payload?.level ?? 0;
+      if (lv in counts) counts[lv]++;
+    }
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset);
+  return counts;
+}
+
+const MCP_TOOL_DEFS = [
+  {
+    name: 'atlas_recall',
+    description: '语义检索知识库，返回最相关的 top-K 条目（含层级、域、重要度）',
+    inputSchema: {
+      type: 'object', required: ['query'],
+      properties: {
+        query:     { type: 'string',  description: '自然语言查询' },
+        limit:     { type: 'integer', default: 5, minimum: 1, maximum: 20 },
+        min_score: { type: 'number',  default: 0.65 },
+      },
+    },
+  },
+  {
+    name: 'atlas_store',
+    description: '向知识库写入一条 L0 原料，自动触发整理 Agent 升级为 L1',
+    inputSchema: {
+      type: 'object', required: ['content'],
+      properties: {
+        content:     { type: 'string' },
+        importance:  { type: 'string', enum: ['low', 'medium', 'high', 'critical'], default: 'medium' },
+        memory_type: { type: 'string', enum: ['fact', 'principle', 'case', 'method', 'quote'], default: 'fact' },
+        tags:        { type: 'array',  items: { type: 'string' }, default: [] },
+      },
+    },
+  },
+  {
+    name: 'atlas_stats',
+    description: '查看知识库状态：L0-L3 各层计数、域分布、服务健康',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'atlas_evolve',
+    description: '手动触发全套 Agent pipeline（整理→域检测→关联→合成→Meta）',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'atlas_feedback',
+    description: '对某条记忆打分，提升或降低其权重',
+    inputSchema: {
+      type: 'object', required: ['id', 'verdict'],
+      properties: {
+        id:      { type: 'string', description: '记忆 ID（从 atlas_recall 获取）' },
+        verdict: { type: 'string', enum: ['correct', 'wrong', 'outdated'] },
+      },
+    },
+  },
+  {
+    name: 'atlas_timeline',
+    description: '按标签查看知识演进时间线（L0→L1→L2→L3 成长轨迹）',
+    inputSchema: {
+      type: 'object', required: ['tag'],
+      properties: {
+        tag:   { type: 'string' },
+        limit: { type: 'integer', default: 20, maximum: 100 },
+        order: { type: 'string',  enum: ['asc', 'desc'], default: 'desc' },
+      },
+    },
+  },
+];
+
+async function mcpExecute(toolName, args) {
+  switch (toolName) {
+
+    case 'atlas_recall': {
+      const { query, limit = 5, min_score = SCORE_MIN } = args;
+      if (!query?.trim()) throw new Error('query 不能为空');
+      const vector = await embed(query);
+      if (!vector) throw new Error('Ollama embed 不可用');
+      const hits = await qdrantSearch(vector, { limit, minScore: min_score });
+      return applyTimeDecay(hits).map(h => ({
+        id: h.id, score: h.score,
+        level: h.payload?.level ?? 0,
+        domain: h.payload?.domain ?? null,
+        content: h.payload?.content,
+        memory_type: h.payload?.memory_type,
+        importance: h.payload?.importance,
+        created_at: h.payload?.created_at,
+      }));
+    }
+
+    case 'atlas_store': {
+      const { content, importance = 'medium', memory_type = 'fact', tags = [] } = args;
+      if (!content?.trim()) throw new Error('content 不能为空');
+      const r = await storeMemory({ content, importance, memory_type, tags, source: 'mcp', level: LEVEL_RAW });
+      if (!r.ok) throw new Error(r.error ?? 'store 失败');
+      return { ok: true, id: r.id, deduplicated: r.deduplicated ?? false };
+    }
+
+    case 'atlas_stats': {
+      const [qdrantRes, levels] = await Promise.all([
+        httpReq(`${QDRANT}/collections/${COLLECTION}`),
+        getLevelStats(),
+      ]);
+      return {
+        version: '10.0.0-phase10',
+        total: qdrantRes.body?.result?.points_count ?? 0,
+        levels: { L0: levels[0], L1: levels[1], L2: levels[2], L3: levels[3] },
+        domains: Object.keys(DOMAIN_DIRS),
+        qdrant_ok: qdrantRes.ok,
+        mcp_port: MCP_PORT,
+      };
+    }
+
+    case 'atlas_evolve': {
+      const r = await runEvolution(null);
+      runOrganizeAgent(null).catch(() => {});
+      return { ok: true, ...r };
+    }
+
+    case 'atlas_feedback': {
+      const { id, verdict } = args;
+      if (!id || !verdict) throw new Error('id 和 verdict 必填');
+      const getR = await httpReq(`${QDRANT}/collections/${COLLECTION}/points`, 'POST',
+        { ids: [id], with_payload: true, with_vector: false });
+      const point = getR.body?.result?.[0];
+      if (!point) throw new Error('记忆不存在');
+      const cur = point.payload?.feedback_score ?? 1.0;
+      const delta = verdict === 'correct' ? FEEDBACK_BOOST : -FEEDBACK_DECAY;
+      const next = Math.max(0, Math.min(1, cur + delta));
+      if (next <= FEEDBACK_DELETE_FLOOR) {
+        await qdrantDelete([id]);
+        return { action: 'deleted', feedback_score: next };
+      }
+      await qdrantPatchPayload(id, { feedback_score: next });
+      return { action: 'updated', verdict, feedback_score: { before: cur, after: next } };
+    }
+
+    case 'atlas_timeline': {
+      const { tag, limit = 20, order = 'desc' } = args;
+      if (!tag?.trim()) throw new Error('tag 不能为空');
+      let offset = null; const pts = [];
+      do {
+        const body = { limit: 100, with_payload: true, with_vector: false,
+          filter: { must: [{ key: 'tags', match: { any: [tag] } },
+                           { must_not: [{ key: 'status', match: { value: 'superseded' } }] }] } };
+        if (offset) body.offset = offset;
+        const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+        if (!r.ok) break;
+        pts.push(...(r.body?.result?.points ?? []));
+        offset = r.body?.result?.next_page_offset ?? null;
+      } while (offset && pts.length < 200);
+      const sorted = pts.sort((a, b) => {
+        const ta = new Date(a.payload?.created_at ?? 0).getTime();
+        const tb = new Date(b.payload?.created_at ?? 0).getTime();
+        return order === 'asc' ? ta - tb : tb - ta;
+      }).slice(0, limit);
+      return sorted.map(p => ({
+        id: p.id, level: p.payload?.level ?? 0,
+        date: (p.payload?.created_at ?? '').slice(0, 10),
+        content: p.payload?.content,
+        memory_type: p.payload?.memory_type,
+      }));
+    }
+
+    default:
+      throw Object.assign(new Error(`未知工具: ${toolName}`), { code: -32601 });
+  }
+}
+
+function startMcpServer(logger) {
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name: 'atlas-memory', version: '10.0.0-phase10' }));
+      return;
+    }
+    if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 1_048_576) req.destroy(); });
+    req.on('end', async () => {
+      let rpcId = null;
+      const send = (payload) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      };
+      try {
+        const rpc = JSON.parse(body);
+        rpcId = rpc.id ?? null;
+        const { method, params } = rpc;
+
+        if (method === 'initialize') {
+          return send({ jsonrpc: '2.0', id: rpcId, result: {
+            protocolVersion: '2024-11-05',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'atlas-memory', version: '10.0.0-phase10' },
+          }});
+        }
+        if (method === 'notifications/initialized') {
+          res.writeHead(204); res.end(); return;
+        }
+        if (method === 'tools/list') {
+          return send({ jsonrpc: '2.0', id: rpcId, result: { tools: MCP_TOOL_DEFS } });
+        }
+        if (method === 'tools/call') {
+          const { name: toolName, arguments: toolArgs } = params ?? {};
+          const result = await mcpExecute(toolName, toolArgs ?? {});
+          return send({ jsonrpc: '2.0', id: rpcId, result: {
+            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          }});
+        }
+        send({ jsonrpc: '2.0', id: rpcId,
+          error: { code: -32601, message: `Method not found: ${method}` } });
+      } catch (e) {
+        send({ jsonrpc: '2.0', id: rpcId,
+          error: { code: e.code ?? -32603, message: e.message } });
+      }
+    });
+  });
+
+  server.on('error', e => logger?.info?.(`[atlas-memory] MCP Server 错误: ${e.message}`));
+  server.listen(MCP_PORT, '127.0.0.1', () =>
+    logger?.info?.(`[atlas-memory] MCP Server 就绪，端口 ${MCP_PORT}（claude_desktop_config: url=http://127.0.0.1:${MCP_PORT}）`)
+  );
+}
+
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase9 — 自主演化知识系统（L0-L3四层 · 5Agent全自治 · INJECT层级优先L3→L1 · 新鲜度过滤 · Obsidian源文件读取 · 自动采集 · 分层Obsidian导出 · Git同步）';
+export const description = 'ATLAS Memory v10.0.0-phase10 — 自主演化知识系统（L0-L3四层 · 5Agent全自治 · INJECT层级优先L3→L1 · 新鲜度过滤 · Obsidian源文件读取 · 自动采集 · 分层Obsidian导出 · Git同步 · MCP Server）';
 
 export function register(api) {
   const logger = api.logger;
+
+  startMcpServer(logger);
 
   ensureCollection()
     .then(() => migrateSchema(logger))
@@ -2767,20 +3006,22 @@ export function register(api) {
     description: '查看 ATLAS 记忆库完整状态：记忆数、模型、缓存命中率、备份时间。',
     parameters: { type: 'object', properties: {} },
     execute: async () => {
-      const [qdrantRes, ollamaRes, omlxRes] = await Promise.all([
+      const [qdrantRes, ollamaRes, omlxRes, levelStats] = await Promise.all([
         httpReq(`${QDRANT}/collections/${COLLECTION}`),
         httpReq(`${OLLAMA}/api/tags`),
         httpReq(`${OMLX}/v1/models`),
+        getLevelStats(),
       ]);
       const ollamaModels = ollamaRes.ok ? (ollamaRes.body?.models ?? []).map(m => m.name) : [];
       const omlxModels   = omlxRes.ok  ? (omlxRes.body?.data   ?? []).map(m => m.id)    : [];
       const total        = embedCacheHits + embedCacheMisses;
       return jsonResult({
-        version: '9.5.0',
+        version: '10.0.0-phase10',
         qdrant: {
           ok:         qdrantRes.ok,
           collection: COLLECTION,
           points:     qdrantRes.body?.result?.points_count ?? 0,
+          levels:     { L0: levelStats[0], L1: levelStats[1], L2: levelStats[2], L3: levelStats[3] },
         },
         models: {
           embed:   { service: 'Ollama', model: EMBED_MODEL, ok: ollamaRes.ok, available: ollamaModels },
