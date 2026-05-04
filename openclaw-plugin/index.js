@@ -598,22 +598,82 @@ function fmtHits(hits) {
   }));
 }
 
-function formatInjectContext(hits) {
+// v10 INJECT：层级优先搜索（L3→L2→L1→L0）
+async function qdrantSearchForInject(vector) {
+  const body = {
+    vector,
+    limit: INJECT_LIMIT * 3, // 多取，排序后截断
+    with_payload: true,
+    score_threshold: SCORE_MIN,
+    filter: {
+      must_not: [
+        { key: 'status', match: { value: 'superseded' } },
+      ],
+    },
+  };
+  const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/search`, 'POST', body);
+  const raw = r.ok ? (r.body?.result ?? []) : [];
+  // 过滤：负反馈 + 低新鲜度
+  const filtered = raw.filter(h =>
+    (h.payload?.feedback_score  ?? 1.0) >= FEEDBACK_FILTER_MIN &&
+    (h.payload?.freshness_score ?? 1.0) >= FRESHNESS_INJECT_MIN
+  );
+  // 排序：level DESC → effectiveScore DESC → importance DESC
+  filtered.sort((a, b) => {
+    const la = a.payload?.level ?? 0;
+    const lb = b.payload?.level ?? 0;
+    if (lb !== la) return lb - la;
+    const sa = a.effectiveScore ?? a.score ?? 0;
+    const sb = b.effectiveScore ?? b.score ?? 0;
+    if (Math.abs(sb - sa) > 0.01) return sb - sa;
+    const ia = IMPORTANCE_ORDER[a.payload?.importance] ?? 2;
+    const ib = IMPORTANCE_ORDER[b.payload?.importance] ?? 2;
+    return ib - ia;
+  });
+  return filtered.slice(0, INJECT_LIMIT);
+}
+
+// 尝试读 Obsidian 源文件，带超时保护
+async function tryReadObsidianFile(obsidianPath, budgetMs = 500) {
+  if (!OBSIDIAN_VAULT || !obsidianPath) return null;
+  try {
+    const fullPath = join(OBSIDIAN_VAULT, obsidianPath);
+    const text = await Promise.race([
+      readFile(fullPath, 'utf8'),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), budgetMs)),
+    ]);
+    // Strip frontmatter
+    return text.replace(/^---[\s\S]*?---\n/, '').trim().slice(0, 600);
+  } catch { return null; }
+}
+
+// v10 formatInjectContext：层级分区 + 源文件内容
+function formatInjectContext(hits, fileContents = {}) {
   if (!hits.length) return '';
-  // ★ 通则([distilled])优先排在最前面
-  const sorted = [...hits].sort((a, b) => {
-    const aD = (a.payload?.tags ?? []).includes(DISTILL_TAG) ? 1 : 0;
-    const bD = (b.payload?.tags ?? []).includes(DISTILL_TAG) ? 1 : 0;
-    return bD - aD;
-  });
-  const lines = sorted.map(h => {
-    const imp  = h.payload?.importance ?? 'medium';
-    const type = h.payload?.memory_type ? `[${h.payload.memory_type}]` : '';
-    const dist = (h.payload?.tags ?? []).includes(DISTILL_TAG) ? '[通则]' : '';
-    const text = h.payload?.content ?? '';
-    return `• [${imp}]${type}${dist} ${text}`;
-  });
-  return `<atlas_memory>\n以下是与当前对话相关的历史记忆（ATLAS Memory 自动检索）：\n${lines.join('\n')}\n</atlas_memory>`;
+
+  const byLevel = { 3: [], 2: [], 1: [], 0: [] };
+  for (const h of hits) {
+    const lvl = h.payload?.level ?? 0;
+    byLevel[Math.min(lvl, 3)].push(h);
+  }
+
+  const levelLabel = { 3: '【L3 智识框架】', 2: '【L2 跨域洞见】', 1: '【L1 知识】', 0: '【L0 原料】' };
+  const sections = [];
+
+  for (const lvl of [3, 2, 1, 0]) {
+    const group = byLevel[lvl];
+    if (!group.length) continue;
+    sections.push(levelLabel[lvl]);
+    for (const h of group) {
+      const domain = h.payload?.domain ? `[${h.payload.domain}]` : '';
+      const topic  = h.payload?.topic  ? ` · ${h.payload.topic}` : '';
+      const full   = fileContents[h.id];
+      const body   = full ?? (h.payload?.content ?? '');
+      sections.push(`${domain}${topic}\n${body}`);
+    }
+  }
+
+  return `<atlas_memory>\n${sections.join('\n\n')}\n</atlas_memory>`;
 }
 
 // ── ★ 知识提炼内部存储 ────────────────────────────────────────────────────────
@@ -2312,7 +2372,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase7 — 自主演化知识系统（L0-L3四层 · 5Agent全自治 · 新鲜度衰减 · 自动采集 · Obsidian日报 · INJECT自然浮现 · atlas_organize/domain_detect/associate/synthesize/meta）';
+export const description = 'ATLAS Memory v10.0.0-phase8 — 自主演化知识系统（L0-L3四层 · 5Agent全自治 · INJECT层级优先L3→L1 · 新鲜度过滤 · Obsidian源文件读取 · 自动采集 · 6工具）';
 
 export function register(api) {
   const logger = api.logger;
@@ -2361,12 +2421,25 @@ export function register(api) {
       const work = (async () => {
         const vector = await embed(query);
         if (!vector) return undefined;
-        const hits = await qdrantSearch(vector, { limit: INJECT_LIMIT });
+        // v10：层级优先搜索
+        const hits = await qdrantSearchForInject(vector);
         if (!hits.length) return undefined;
         const decayed = applyTimeDecay(hits);
-        lastInjectedIds = decayed.map(h => h.id);  // ★ 追踪注入 ID，供 feedback 定位
+        lastInjectedIds = decayed.map(h => h.id);
         trackAccess(decayed).catch(() => {});
-        return { prependContext: formatInjectContext(decayed) };
+
+        // 在剩余预算内读 L2/L3 源文件（每文件 500ms 上限，并行）
+        const fileContents = {};
+        const highLevelHits = decayed.filter(h => (h.payload?.level ?? 0) >= LEVEL_INSIGHT);
+        if (highLevelHits.length && OBSIDIAN_VAULT) {
+          const reads = highLevelHits.map(async h => {
+            const text = await tryReadObsidianFile(h.payload?.obsidian_path, 500);
+            if (text) fileContents[h.id] = text;
+          });
+          await Promise.allSettled(reads);
+        }
+
+        return { prependContext: formatInjectContext(decayed, fileContents) };
       })();
       const deadline = new Promise(res => setTimeout(() => res(undefined), INJECT_TIMEOUT_MS));
       const result   = await Promise.race([work, deadline]);
