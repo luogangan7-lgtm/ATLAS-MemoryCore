@@ -1,5 +1,5 @@
 /**
- * ATLAS Memory v9.5.0 — Commercial-Grade Semantic Memory + Obsidian Bridge
+ * ATLAS Memory v10.0.0-phase1 — 自主演化知识系统（L0-L3 · WriteQueue · 6Agent · 鲜度衰减）
  *
  * 架构（四层，商业级）：
  *   INJECT  — LRU缓存 + 跳过短/重复 + 时间衰减 + 访问计数 + 注入 memory_type
@@ -96,6 +96,38 @@ const MIRROR_LINK_MAX        = 5;
 const MIRROR_EXPORT_INTERVAL = 6 * 60 * 60 * 1000;
 const IMPORTANCE_ORDER       = { critical: 4, high: 3, medium: 2, low: 1 };
 
+// ── v10 知识库常量 ─────────────────────────────────────────────────────────────
+const LEVEL_RAW          = 0;  // L0 原料
+const LEVEL_KNOWLEDGE    = 1;  // L1 知识
+const LEVEL_INSIGHT      = 2;  // L2 关联
+const LEVEL_WISDOM       = 3;  // L3 智识
+
+const ORGANIZE_INTERVAL_MS   = 60 * 60 * 1000;         // 1h
+const DOMAIN_INTERVAL_MS     = 6 * 60 * 60 * 1000;     // 6h
+const ASSOCIATE_INTERVAL_MS  = 6 * 60 * 60 * 1000;     // 6h
+const SYNTHESIZE_INTERVAL_MS = 12 * 60 * 60 * 1000;    // 12h
+const META_INTERVAL_MS       = 24 * 60 * 60 * 1000;    // 24h
+
+const FRESHNESS_REFRESH      = 0.40;  // 低于此值重新验证
+const FRESHNESS_INJECT_MIN   = 0.20;  // 低于此值不注入
+const DOMAIN_MATCH_SCORE     = 0.80;  // 域精确匹配门槛
+const DOMAIN_SUBDOMAIN_SCORE = 0.65;  // 子域匹配门槛
+const CLUSTER_MIN_SIZE       = 3;     // 聚类最小记忆数
+const CLUSTER_MIN_SCORE      = 0.70;
+const ASSOC_MIN_SCORE        = 0.65;  // 关联搜索下界
+const ASSOC_MAX_SCORE        = 0.85;  // 关联搜索上界（避开直接重复）
+const DECAY_HALF_LIFE        = { fast: 7, medium: 30, slow: 180 }; // 单位：天
+const MCP_PORT               = parseInt(process.env.ATLAS_MCP_PORT ?? '8765');
+const GITHUB_REPO            = process.env.ATLAS_GITHUB_REPO ?? '';
+
+// 域目录映射（vault 根目录下的域文件夹名）
+const DOMAIN_DIRS = {
+  '营销': '营销', '品牌项目': '品牌项目', '情感学': '情感学',
+  '战略': '战略', 'TikTok运营': 'TikTok运营', '五金工具-电焊机': '五金工具-电焊机',
+  '储能电池': '储能电池', 'OKX交易': 'OKX交易',
+};
+const LEVEL_DIRS = ['L0-原料', 'L1-知识', 'L2-关联', 'L3-智识'];
+
 // ── 运行时状态 ─────────────────────────────────────────────────────────────────
 const embedCache     = new Map();
 let embedCacheHits   = 0;
@@ -106,6 +138,41 @@ let lastInjectResult = undefined;
 let lastBackupTime   = null;
 let   lastInjectedIds        = [];             // ★ INJECT 注入的记忆 ID，供 feedback 定位
 const distillWrittenHashes   = new Set();      // ★ distill 已写入的 hash，阻止 CAPTURE 二次捕获
+
+// ── WriteQueue（并发安全，P1=CAPTURE/LEARN，P2=Agent）────────────────────────
+class WriteQueue {
+  constructor() { this._queue = []; this._running = false; }
+  push(priority, fn) {
+    return new Promise((resolve, reject) => {
+      this._queue.push({ priority, fn, resolve, reject });
+      this._queue.sort((a, b) => a.priority - b.priority);
+      this._drain();
+    });
+  }
+  async _drain() {
+    if (this._running || !this._queue.length) return;
+    this._running = true;
+    while (this._queue.length) {
+      const { fn, resolve, reject } = this._queue.shift();
+      try { resolve(await fn()); } catch (e) { reject(e); }
+    }
+    this._running = false;
+  }
+}
+const writeQueue = new WriteQueue();
+const WRITE_PRIORITY = { CAPTURE: 1, LEARN: 1, AGENT: 2 };
+
+// ── Agent 锁（防止同一 Agent 并发执行）───────────────────────────────────────
+const agentLocks = new Map([
+  ['organize', false], ['domain', false], ['associate', false],
+  ['synthesize', false], ['meta', false], ['restructure', false],
+]);
+
+async function runAgent(name, fn) {
+  if (agentLocks.get(name)) return;
+  agentLocks.set(name, true);
+  try { await fn(); } finally { agentLocks.set(name, false); }
+}
 
 // ── HTTP/HTTPS 工具 ───────────────────────────────────────────────────────────
 function httpReq(url, method = 'GET', body = null, extraHeaders = {}, timeoutMs = TIMEOUT_MS) {
@@ -1105,6 +1172,93 @@ async function appendEvolutionLog(type, message) {
   } catch { /* 静默：日志写失败不影响主流程 */ }
 }
 
+// ── v10 Schema 迁移（启动时运行，向后兼容旧记录）─────────────────────────────
+async function migrateSchema(logger) {
+  let offset = null;
+  let patched = 0;
+  const now = new Date().toISOString();
+  do {
+    const body = { limit: 250, with_payload: true, with_vector: false };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    const points = r.body?.result?.points ?? [];
+    for (const pt of points) {
+      const p = pt.payload ?? {};
+      if (p.level !== undefined && p.freshness_score !== undefined) continue;
+      const patch = {};
+      if (p.level            === undefined) patch.level            = LEVEL_KNOWLEDGE;
+      if (p.domain           === undefined) patch.domain           = null;
+      if (p.topic            === undefined) patch.topic            = p.tags?.[0] ?? p.category ?? 'general';
+      if (p.freshness_score  === undefined) patch.freshness_score  = 1.0;
+      if (p.decay_rate       === undefined) patch.decay_rate       = 'medium';
+      if (p.last_verified    === undefined) patch.last_verified    = now;
+      if (p.source_ids       === undefined) patch.source_ids       = [];
+      if (p.associated_ids   === undefined) patch.associated_ids   = [];
+      if (p.derived_to_id    === undefined) patch.derived_to_id    = null;
+      if (p.obsidian_path    === undefined) patch.obsidian_path    = null;
+      if (p.acquisition_source === undefined) patch.acquisition_source = p.source ?? 'auto-capture';
+      await qdrantPatchPayload(pt.id, patch);
+      patched++;
+    }
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null);
+  if (patched > 0) logger?.info?.(`[atlas-memory] v10 schema 迁移：${patched} 条记录已更新`);
+  return { patched };
+}
+
+// ── v10 L0 原料统一摄入 ───────────────────────────────────────────────────────
+async function intakeToL0({ content, domain, topic, source = 'manual', tags = [], category = 'work', sessionKey }) {
+  return writeQueue.push(WRITE_PRIORITY.CAPTURE, async () => {
+    const domainDir = DOMAIN_DIRS[domain] ?? null;
+    const level0Dir = OBSIDIAN_VAULT
+      ? (domainDir ? join(OBSIDIAN_VAULT, domainDir, 'L0-原料') : join(OBSIDIAN_VAULT, '_未分类'))
+      : null;
+    const slug     = (topic ?? 'untitled').replace(/[/\\:*?"<>|]/g, '-').slice(0, 40);
+    const date     = new Date().toISOString().slice(0, 10);
+    const filename = `${slug}-${date}.md`;
+    let   obsidianPath = null;
+
+    if (level0Dir) {
+      await mkdir(level0Dir, { recursive: true });
+      const md = `---\nlevel: L0\ndomain: ${domain ?? '未分类'}\ntopic: ${topic ?? ''}\nsource: ${source}\ncreated: ${new Date().toISOString()}\ntags: [${tags.map(t => `"${t}"`).join(', ')}]\n---\n\n${content}\n`;
+      await writeFile(join(level0Dir, filename), md, 'utf8');
+      obsidianPath = domainDir ? `${domainDir}/L0-原料/${filename}` : `_未分类/${filename}`;
+    }
+
+    const vector = await embed(content);
+    if (!vector) return { ok: false, error: 'embed failed' };
+    await ensureCollection();
+    const now = new Date().toISOString();
+    const payload = {
+      content:           content.trim(),
+      category,
+      importance:        'medium',
+      tags:              Array.isArray(tags) ? tags : [],
+      memory_type:       'fact',
+      created_at:        now,
+      source,
+      session_key:       sessionKey ?? 'manual',
+      hit_count:         0,
+      last_accessed_at:  null,
+      status:            'active',
+      feedback_score:    1.0,
+      level:             LEVEL_RAW,
+      domain:            domain ?? null,
+      topic:             topic ?? tags[0] ?? category,
+      freshness_score:   1.0,
+      decay_rate:        'medium',
+      last_verified:     now,
+      source_ids:        [],
+      associated_ids:    [],
+      derived_to_id:     null,
+      obsidian_path:     obsidianPath,
+      acquisition_source: source,
+    };
+    return upsert(vector, payload);
+  });
+}
+
 // ── 工具结果格式 ──────────────────────────────────────────────────────────────
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -1112,12 +1266,14 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v9.5.0 — 商业级语义记忆 + Obsidian Bridge（反馈回路 · 知识提炼 · 版本化 · 主题时间线 · 进化监控台）';
+export const description = 'ATLAS Memory v10.0.0-phase1 — 自主演化知识系统（L0-L3四层 · WriteQueue并发安全 · 6Agent架构 · 鲜度衰减 · MCP就绪）';
 
 export function register(api) {
   const logger = api.logger;
 
-  ensureCollection().catch(() => {});
+  ensureCollection()
+    .then(() => migrateSchema(logger))
+    .catch(() => {});
   setInterval(() => runEvolution(logger).catch(() => {}), 24 * 60 * 60 * 1000);
   setInterval(() => backupCollection(logger).catch(() => {}), 7 * 24 * 60 * 60 * 1000);
 
@@ -1237,7 +1393,7 @@ export function register(api) {
       try {
         const vector  = await embed(query);
         if (!vector) return [];
-        const hits    = await qdrantSearch(vector, { limit: maxResults });
+        const hits    = await qdrantSearch(vector, { limit: maxResults, minScore: 0.50 });
         const decayed = applyTimeDecay(hits);
         return decayed.map(h => ({
           corpus:     'atlas',
