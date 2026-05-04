@@ -1737,6 +1737,191 @@ async function runDomainDetectAgent(logger) {
   return { checked: unassigned.length, clusters_found: clusters.length, new_domains: newDomains, assigned };
 }
 
+// ── Phase 5：关联Agent ────────────────────────────────────────────────────────
+
+let lastAssociateRun = 0; // unix ms，用于只取上轮以来新增的L1
+
+async function generateCrossInsight(nodeA, nodeB) {
+  const ca = nodeA.payload?.content?.slice(0, 200) ?? '';
+  const cb = nodeB.payload?.content?.slice(0, 200) ?? '';
+  const da = nodeA.payload?.domain ?? '未分类';
+  const db = nodeB.payload?.domain ?? '未分类';
+  const sys = '你是跨域知识关联专家。严格输出一段100-150字的中文洞察，不要解释，不要标题，不要JSON。';
+  const user =
+    `域A（${da}）知识：${ca}\n\n域B（${db}）知识：${cb}\n\n` +
+    `请写出这两条知识的跨域关联洞察：它们共同揭示了什么规律？如何相互印证或补充？对实际决策有何启示？`;
+  return omlxGenerate(sys, user, 300, AGENT_OMLX_TIMEOUT_MS);
+}
+
+async function writeL2Obsidian(domain, topic, insight, srcAPath, srcBPath, domainB) {
+  if (!OBSIDIAN_VAULT) return null;
+  const domainDir = DOMAIN_DIRS[domain] ?? domain;
+  const dir = join(OBSIDIAN_VAULT, domainDir, 'L2-关联');
+  await mkdir(dir, { recursive: true });
+  const slug = topic.replace(/[/\\:*?"<>|]/g, '-').slice(0, 40);
+  const date = new Date().toISOString().slice(0, 10);
+  const filename = `${slug}-${date}.md`;
+  const linkA = srcAPath ? `[[${srcAPath.replace(/\.md$/, '')}]]` : '';
+  const linkB = srcBPath ? `[[${srcBPath.replace(/\.md$/, '')}]]` : '';
+  const md = [
+    '---',
+    `level: L2`,
+    `domain: ${domain}`,
+    `linked_domain: ${domainB}`,
+    `topic: ${topic}`,
+    `created: ${new Date().toISOString()}`,
+    '---',
+    '',
+    `# ${topic}`,
+    '',
+    insight,
+    '',
+    '## 来源',
+    `- ${linkA || srcAPath || '(未知)'}`,
+    `- ${linkB || srcBPath || '(未知)'}`,
+  ].join('\n');
+  await writeFile(join(dir, filename), md, 'utf8');
+  return `${domainDir}/L2-关联/${filename}`;
+}
+
+async function appendWikilink(obsidianPath, linkTarget) {
+  if (!OBSIDIAN_VAULT || !obsidianPath) return;
+  const fullPath = join(OBSIDIAN_VAULT, obsidianPath);
+  const link = `\n\n## 关联洞见\n- [[${linkTarget.replace(/\.md$/, '')}]]\n`;
+  await appendFile(fullPath, link, 'utf8').catch(() => {});
+}
+
+async function runAssociateAgent(logger) {
+  const since = lastAssociateRun;
+  lastAssociateRun = Date.now();
+
+  // 1. Fetch L1 nodes added since last run (or all L1 if first run)
+  const l1Nodes = [];
+  let offset = null;
+  const filter = since > 0
+    ? { must: [
+        { match: { key: 'level', value: LEVEL_KNOWLEDGE } },
+        { match: { key: 'status', value: 'active' } },
+        { range: { key: 'created_at', gte: new Date(since).toISOString() } },
+      ] }
+    : { must: [
+        { match: { key: 'level', value: LEVEL_KNOWLEDGE } },
+        { match: { key: 'status', value: 'active' } },
+      ] };
+
+  do {
+    const body = { limit: 200, with_payload: true, with_vector: true, filter };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    l1Nodes.push(...(r.body?.result?.points ?? []));
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null);
+
+  if (!l1Nodes.length) {
+    logger?.info?.('[atlas-memory] 关联Agent: 无新L1节点，跳过');
+    return { checked: 0, created: 0 };
+  }
+
+  logger?.info?.(`[atlas-memory] 关联Agent: 检查${l1Nodes.length}个L1节点`);
+  let created = 0;
+
+  for (const node of l1Nodes) {
+    const nodeDomain = node.payload?.domain ?? null;
+
+    // 2. Cross-domain similarity search
+    const hits = await qdrantSearch(node.vector, {
+      limit: 10,
+      minScore: ASSOC_MIN_SCORE,
+      filter: {
+        must: [
+          { match: { key: 'level', value: LEVEL_KNOWLEDGE } },
+          { match: { key: 'status', value: 'active' } },
+        ],
+        // Exclude same node
+        must_not: [{ has_id: [node.id] }],
+      },
+    });
+
+    // Filter: different domain + score in (ASSOC_MIN_SCORE, ASSOC_MAX_SCORE]
+    const candidates = hits.filter(h => {
+      const hd = h.payload?.domain ?? null;
+      return h.score <= ASSOC_MAX_SCORE && hd !== nodeDomain;
+    });
+
+    for (const partner of candidates.slice(0, 2)) { // max 2 associations per node
+      const partnerDomain = partner.payload?.domain ?? null;
+
+      // 3. Generate cross-domain insight via omlx
+      const insight = await generateCrossInsight(node, partner);
+      if (!insight || insight.length < 30) continue;
+
+      const topicA = node.payload?.topic ?? node.payload?.tags?.[0] ?? '知识';
+      const topicB = partner.payload?.topic ?? partner.payload?.tags?.[0] ?? '知识';
+      const insightTopic = `${topicA}×${topicB}`;
+
+      // 4. Write L2 Obsidian files for BOTH domains
+      const pathA = node.payload?.obsidian_path ?? null;
+      const pathB = partner.payload?.obsidian_path ?? null;
+
+      const domainADir = nodeDomain ?? '未分类';
+      const domainBDir = partnerDomain ?? '未分类';
+
+      const l2PathA = await writeL2Obsidian(domainADir, insightTopic, insight, pathA, pathB, domainBDir);
+      const l2PathB = partnerDomain && partnerDomain !== nodeDomain
+        ? await writeL2Obsidian(domainBDir, insightTopic, insight, pathB, pathA, domainADir)
+        : null;
+
+      // 5. Append wikilinks to L1 source files
+      if (l2PathA) {
+        await appendWikilink(pathA, l2PathA);
+        await appendWikilink(pathB, l2PathA);
+      }
+
+      // 6. Upsert L2 node in Qdrant
+      const vector = await embed(insight);
+      if (vector) {
+        await writeQueue.push(WRITE_PRIORITY.AGENT, async () => {
+          const now = new Date().toISOString();
+          const decay_rate = 'medium';
+          await upsert(vector, {
+            content:            insight,
+            category:           'work',
+            importance:         'high',
+            tags:               [domainADir, domainBDir, 'cross-domain'],
+            memory_type:        'insight',
+            created_at:         now,
+            source:             'associate-agent',
+            session_key:        'agent',
+            hit_count:          0,
+            last_accessed_at:   null,
+            status:             'active',
+            feedback_score:     1.0,
+            level:              LEVEL_INSIGHT,
+            domain:             domainADir,
+            topic:              insightTopic,
+            freshness_score:    1.0,
+            decay_rate,
+            last_verified:      now,
+            source_ids:         [],
+            associated_ids:     [node.id, partner.id],
+            derived_to_id:      null,
+            obsidian_path:      l2PathA,
+            acquisition_source: 'associate-agent',
+          });
+        });
+        created++;
+        appendEvolutionLog('ASSOCIATE',
+          `L2洞见: "${insightTopic}" [${domainADir}×${domainBDir}]`
+        ).catch(() => {});
+      }
+    }
+  }
+
+  logger?.info?.(`[atlas-memory] 关联Agent: 新建${created}个L2洞见`);
+  return { checked: l1Nodes.length, created };
+}
+
 // ── 工具结果格式 ──────────────────────────────────────────────────────────────
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -1744,7 +1929,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase4 — 自主演化知识系统（L0-L3四层 · 整理Agent · 域检测Agent · 向量聚类 · DeepSeek域推断 · Obsidian维度图谱 · atlas_organize · atlas_domain_detect）';
+export const description = 'ATLAS Memory v10.0.0-phase5 — 自主演化知识系统（L0-L3四层 · 整理/域检测/关联Agent · 跨域L1碰撞 · L2洞见 · wikilinks · atlas_organize · atlas_domain_detect · atlas_associate）';
 
 export function register(api) {
   const logger = api.logger;
@@ -1761,6 +1946,9 @@ export function register(api) {
   // Phase 4：域检测Agent（6h 周期 + 启动后 30s 首次触发）
   setInterval(() => runAgent('domain', () => runDomainDetectAgent(logger)).catch(() => {}), DOMAIN_INTERVAL_MS);
   setTimeout(() => runAgent('domain', () => runDomainDetectAgent(logger)).catch(() => {}), 30_000);
+  // Phase 5：关联Agent（6h 周期 + 启动后 60s 首次触发，在域检测之后）
+  setInterval(() => runAgent('associate', () => runAssociateAgent(logger)).catch(() => {}), ASSOCIATE_INTERVAL_MS);
+  setTimeout(() => runAgent('associate', () => runAssociateAgent(logger)).catch(() => {}), 60_000);
 
   // Obsidian Bridge：每 6 小时自动刷新监控台
   if (OBSIDIAN_VAULT) {
@@ -2075,6 +2263,24 @@ export function register(api) {
         if (agentLocks.get('domain')) return jsonResult({ ok: false, reason: '域检测Agent正在运行，请稍后重试' });
         const result = await new Promise((resolve, reject) => {
           runAgent('domain', () => runDomainDetectAgent(logger)).then(resolve).catch(reject);
+        });
+        return jsonResult({ ok: true, ...(result ?? {}) });
+      } catch (e) {
+        return jsonResult({ error: e.message });
+      }
+    },
+  }));
+
+  // atlas_associate（Phase 5）
+  api.registerTool(() => ({
+    name: 'atlas_associate',
+    description: '手动触发关联Agent：扫描新增L1节点，跨域碰撞生成L2洞见，写入两个域的L2-关联/目录，追加wikilinks到L1源文件。',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      try {
+        if (agentLocks.get('associate')) return jsonResult({ ok: false, reason: '关联Agent正在运行，请稍后重试' });
+        const result = await new Promise((resolve, reject) => {
+          runAgent('associate', () => runAssociateAgent(logger)).then(resolve).catch(reject);
         });
         return jsonResult({ ok: true, ...(result ?? {}) });
       } catch (e) {
