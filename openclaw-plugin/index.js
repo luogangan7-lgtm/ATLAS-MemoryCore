@@ -1787,8 +1787,33 @@ async function writeL2Obsidian(domain, topic, insight, srcAPath, srcBPath, domai
 async function appendWikilink(obsidianPath, linkTarget) {
   if (!OBSIDIAN_VAULT || !obsidianPath) return;
   const fullPath = join(OBSIDIAN_VAULT, obsidianPath);
-  const link = `\n\n## 关联洞见\n- [[${linkTarget.replace(/\.md$/, '')}]]\n`;
-  await appendFile(fullPath, link, 'utf8').catch(() => {});
+  // 幂等：已含该链接则跳过
+  const existing = await readFile(fullPath, 'utf8').catch(() => '');
+  const linkStr = `[[${linkTarget.replace(/\.md$/, '')}]]`;
+  if (existing.includes(linkStr)) return;
+  await appendFile(fullPath, `\n- ${linkStr}\n`, 'utf8').catch(() => {});
+}
+
+async function qdrantSearchL1(vector, excludeId) {
+  // 直接走 httpReq，支持 level + status 过滤 + 排除自身
+  const body = {
+    vector,
+    limit: 10,
+    with_payload: true,
+    score_threshold: ASSOC_MIN_SCORE,
+    filter: {
+      must: [
+        { key: 'level',  match: { value: LEVEL_KNOWLEDGE } },
+        { key: 'status', match: { value: 'active' } },
+      ],
+      must_not: [
+        { key: 'status', match: { value: 'superseded' } },
+        { has_id: [excludeId] },
+      ],
+    },
+  };
+  const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/search`, 'POST', body);
+  return r.ok ? (r.body?.result ?? []) : [];
 }
 
 async function runAssociateAgent(logger) {
@@ -1798,19 +1823,19 @@ async function runAssociateAgent(logger) {
   // 1. Fetch L1 nodes added since last run (or all L1 if first run)
   const l1Nodes = [];
   let offset = null;
-  const filter = since > 0
+  const scrollFilter = since > 0
     ? { must: [
-        { match: { key: 'level', value: LEVEL_KNOWLEDGE } },
-        { match: { key: 'status', value: 'active' } },
-        { range: { key: 'created_at', gte: new Date(since).toISOString() } },
+        { key: 'level',  match: { value: LEVEL_KNOWLEDGE } },
+        { key: 'status', match: { value: 'active' } },
+        { key: 'created_at', range: { gte: new Date(since).toISOString() } },
       ] }
     : { must: [
-        { match: { key: 'level', value: LEVEL_KNOWLEDGE } },
-        { match: { key: 'status', value: 'active' } },
+        { key: 'level',  match: { value: LEVEL_KNOWLEDGE } },
+        { key: 'status', match: { value: 'active' } },
       ] };
 
   do {
-    const body = { limit: 200, with_payload: true, with_vector: true, filter };
+    const body = { limit: 200, with_payload: true, with_vector: true, filter: scrollFilter };
     if (offset != null) body.offset = offset;
     const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
     if (!r.ok) break;
@@ -1825,31 +1850,27 @@ async function runAssociateAgent(logger) {
 
   logger?.info?.(`[atlas-memory] 关联Agent: 检查${l1Nodes.length}个L1节点`);
   let created = 0;
+  // 本轮已处理对，防止 A→B 和 B→A 重复生成
+  const processedPairs = new Set();
 
   for (const node of l1Nodes) {
     const nodeDomain = node.payload?.domain ?? null;
 
-    // 2. Cross-domain similarity search
-    const hits = await qdrantSearch(node.vector, {
-      limit: 10,
-      minScore: ASSOC_MIN_SCORE,
-      filter: {
-        must: [
-          { match: { key: 'level', value: LEVEL_KNOWLEDGE } },
-          { match: { key: 'status', value: 'active' } },
-        ],
-        // Exclude same node
-        must_not: [{ has_id: [node.id] }],
-      },
-    });
+    // 2. Cross-domain similarity search，仅返回 L1 active 节点
+    const hits = await qdrantSearchL1(node.vector, node.id);
 
-    // Filter: different domain + score in (ASSOC_MIN_SCORE, ASSOC_MAX_SCORE]
+    // 过滤：不同域 + 分数在 (ASSOC_MIN_SCORE, ASSOC_MAX_SCORE]
     const candidates = hits.filter(h => {
       const hd = h.payload?.domain ?? null;
       return h.score <= ASSOC_MAX_SCORE && hd !== nodeDomain;
     });
 
-    for (const partner of candidates.slice(0, 2)) { // max 2 associations per node
+    for (const partner of candidates.slice(0, 2)) {
+      // 去重：同一对只处理一次
+      const pairKey = [node.id, partner.id].sort().join(':');
+      if (processedPairs.has(pairKey)) continue;
+      processedPairs.add(pairKey);
+
       const partnerDomain = partner.payload?.domain ?? null;
 
       // 3. Generate cross-domain insight via omlx
@@ -1860,56 +1881,46 @@ async function runAssociateAgent(logger) {
       const topicB = partner.payload?.topic ?? partner.payload?.tags?.[0] ?? '知识';
       const insightTopic = `${topicA}×${topicB}`;
 
-      // 4. Write L2 Obsidian files for BOTH domains
       const pathA = node.payload?.obsidian_path ?? null;
       const pathB = partner.payload?.obsidian_path ?? null;
-
       const domainADir = nodeDomain ?? '未分类';
       const domainBDir = partnerDomain ?? '未分类';
 
+      // 4. 两个域各写一份 L2 文件
       const l2PathA = await writeL2Obsidian(domainADir, insightTopic, insight, pathA, pathB, domainBDir);
-      const l2PathB = partnerDomain && partnerDomain !== nodeDomain
+      const l2PathB = domainBDir !== domainADir
         ? await writeL2Obsidian(domainBDir, insightTopic, insight, pathB, pathA, domainADir)
         : null;
 
-      // 5. Append wikilinks to L1 source files
-      if (l2PathA) {
-        await appendWikilink(pathA, l2PathA);
-        await appendWikilink(pathB, l2PathA);
-      }
+      // 5. 各自 wikilink 指向自己域的 L2 文件（幂等写入）
+      if (l2PathA) await appendWikilink(pathA, l2PathA);
+      if (l2PathB) await appendWikilink(pathB, l2PathB);
+      else if (l2PathA) await appendWikilink(pathB, l2PathA);
 
-      // 6. Upsert L2 node in Qdrant
+      // 6. Qdrant：两条 L2 节点，各属自己的域
       const vector = await embed(insight);
       if (vector) {
-        await writeQueue.push(WRITE_PRIORITY.AGENT, async () => {
-          const now = new Date().toISOString();
-          const decay_rate = 'medium';
-          await upsert(vector, {
-            content:            insight,
-            category:           'work',
-            importance:         'high',
-            tags:               [domainADir, domainBDir, 'cross-domain'],
-            memory_type:        'insight',
-            created_at:         now,
-            source:             'associate-agent',
-            session_key:        'agent',
-            hit_count:          0,
-            last_accessed_at:   null,
-            status:             'active',
-            feedback_score:     1.0,
-            level:              LEVEL_INSIGHT,
-            domain:             domainADir,
-            topic:              insightTopic,
-            freshness_score:    1.0,
-            decay_rate,
-            last_verified:      now,
-            source_ids:         [],
-            associated_ids:     [node.id, partner.id],
-            derived_to_id:      null,
-            obsidian_path:      l2PathA,
-            acquisition_source: 'associate-agent',
-          });
-        });
+        const now = new Date().toISOString();
+        const base = {
+          content: insight, category: 'work', importance: 'high',
+          tags: [domainADir, domainBDir, 'cross-domain'],
+          memory_type: 'insight', created_at: now,
+          source: 'associate-agent', session_key: 'agent',
+          hit_count: 0, last_accessed_at: null, status: 'active',
+          feedback_score: 1.0, level: LEVEL_INSIGHT,
+          topic: insightTopic, freshness_score: 1.0, decay_rate: 'medium',
+          last_verified: now, source_ids: [],
+          associated_ids: [node.id, partner.id],
+          derived_to_id: null, acquisition_source: 'associate-agent',
+        };
+        await writeQueue.push(WRITE_PRIORITY.AGENT, () =>
+          upsert(vector, { ...base, domain: domainADir, obsidian_path: l2PathA })
+        );
+        if (l2PathB) {
+          await writeQueue.push(WRITE_PRIORITY.AGENT, () =>
+            upsert(vector, { ...base, domain: domainBDir, obsidian_path: l2PathB })
+          );
+        }
         created++;
         appendEvolutionLog('ASSOCIATE',
           `L2洞见: "${insightTopic}" [${domainADir}×${domainBDir}]`
