@@ -1933,6 +1933,200 @@ async function runAssociateAgent(logger) {
   return { checked: l1Nodes.length, created };
 }
 
+// ── Phase 6：合成Agent ────────────────────────────────────────────────────────
+
+async function getNextL3Version(domain) {
+  // Scan existing L3 nodes for this domain, return max version + 1
+  const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', {
+    limit: 100,
+    with_payload: true,
+    with_vector: false,
+    filter: {
+      must: [
+        { key: 'level',  match: { value: LEVEL_WISDOM } },
+        { key: 'domain', match: { value: domain } },
+        { key: 'status', match: { value: 'active' } },
+      ],
+    },
+  });
+  const pts = r.body?.result?.points ?? [];
+  let max = 0;
+  for (const pt of pts) {
+    const m = (pt.payload?.topic ?? '').match(/v(\d+)$/);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  return max + 1;
+}
+
+async function synthesizeL3(cluster, domain) {
+  const excerpts = cluster
+    .slice(0, 6)
+    .map((n, i) => `洞见${i + 1}：${n.payload?.content?.slice(0, 200) ?? ''}`)
+    .join('\n\n');
+  const sys = '你是战略框架合成专家。严格输出JSON，不要markdown代码块，不要解释。';
+  const user =
+    `以下是来自"${domain}"领域的跨域洞见集群：\n\n${excerpts}\n\n` +
+    `请综合这些洞见，生成一套可直接指导行动的框架。输出：\n` +
+    `{"title":"框架名称（不超过10字）","summary":"核心论点（30-60字）",` +
+    `"principles":["原则1（15-25字）","原则2","原则3"],"actions":["行动建议1","行动建议2","行动建议3"],` +
+    `"conditions":"适用场景（20-40字）"}`;
+  const raw = await deepseekGenerate(sys, user, 600);
+  if (!raw) return null;
+  try {
+    const cleaned = raw.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+    if (!parsed.title || !parsed.summary) return null;
+    parsed.principles = Array.isArray(parsed.principles) ? parsed.principles.slice(0, 5) : [];
+    parsed.actions    = Array.isArray(parsed.actions)    ? parsed.actions.slice(0, 5)    : [];
+    return parsed;
+  } catch { return null; }
+}
+
+async function writeL3Obsidian(domain, framework, version, sourceIds) {
+  if (!OBSIDIAN_VAULT) return null;
+  const domainDir = DOMAIN_DIRS[domain] ?? domain;
+  const dir = join(OBSIDIAN_VAULT, domainDir, 'L3-智识');
+  await mkdir(dir, { recursive: true });
+  const filename = `${domain}打法-v${version}.md`;
+  const principles = (framework.principles ?? []).map(p => `- ${p}`).join('\n');
+  const actions    = (framework.actions ?? []).map(a => `- [ ] ${a}`).join('\n');
+  const sourceLinks = sourceIds.map(id => `- ID:${id}`).join('\n');
+  const now = new Date().toISOString();
+  const md = [
+    '---',
+    `level: L3`,
+    `domain: ${domain}`,
+    `version: v${version}`,
+    `title: ${framework.title}`,
+    `created: ${now}`,
+    `source_count: ${sourceIds.length}`,
+    '---',
+    '',
+    `# ${framework.title}`,
+    `> v${version} · ${domain} · ${now.slice(0, 10)}`,
+    '',
+    `## 核心论点`,
+    framework.summary,
+    '',
+    `## 原则`,
+    principles,
+    '',
+    `## 行动清单`,
+    actions,
+    '',
+    `## 适用条件`,
+    framework.conditions ?? '',
+    '',
+    `## 来源洞见`,
+    sourceLinks,
+  ].join('\n');
+  await writeFile(join(dir, filename), md, 'utf8');
+  return `${domainDir}/L3-智识/${filename}`;
+}
+
+async function runSynthesizeAgent(logger) {
+  // 1. Fetch all L2 active nodes with vectors
+  const l2Nodes = [];
+  let offset = null;
+  do {
+    const body = {
+      limit: 500, with_payload: true, with_vector: true,
+      filter: {
+        must: [
+          { key: 'level',  match: { value: LEVEL_INSIGHT } },
+          { key: 'status', match: { value: 'active' } },
+        ],
+      },
+    };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    l2Nodes.push(...(r.body?.result?.points ?? []));
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null);
+
+  if (!l2Nodes.length) {
+    logger?.info?.('[atlas-memory] 合成Agent: 无L2节点，跳过');
+    return { l2_scanned: 0, clusters: 0, synthesized: 0 };
+  }
+
+  logger?.info?.(`[atlas-memory] 合成Agent: 扫描${l2Nodes.length}个L2节点`);
+
+  // 2. Cluster L2 nodes by domain then by vector similarity
+  const byDomain = new Map();
+  for (const n of l2Nodes) {
+    const d = n.payload?.domain ?? '未分类';
+    if (!byDomain.has(d)) byDomain.set(d, []);
+    byDomain.get(d).push(n);
+  }
+
+  let synthesized = 0;
+  let totalClusters = 0;
+
+  for (const [domain, nodes] of byDomain) {
+    // Skip nodes already derived to an L3
+    const underivedNodes = nodes.filter(n => !n.payload?.derived_to_id);
+    if (underivedNodes.length < CLUSTER_MIN_SIZE) continue;
+
+    const clusters = clusterNodes(underivedNodes, CLUSTER_MIN_SCORE, CLUSTER_MIN_SIZE);
+    totalClusters += clusters.length;
+
+    for (const cluster of clusters) {
+      // 3. DeepSeek synthesis
+      const framework = await synthesizeL3(cluster, domain);
+      if (!framework) continue;
+
+      // 4. Version numbering
+      const version = await getNextL3Version(domain);
+      const topic   = `${framework.title}-v${version}`;
+
+      // 5. Write L3 Obsidian
+      const sourceIds = cluster.map(n => n.id);
+      const l3Path = await writeL3Obsidian(domain, framework, version, sourceIds);
+
+      // 6. Upsert L3 Qdrant node
+      const content = `${framework.title}：${framework.summary}。原则：${(framework.principles ?? []).join('；')}`;
+      const vector  = await embed(content);
+      if (!vector) continue;
+
+      let l3Id;
+      await writeQueue.push(WRITE_PRIORITY.AGENT, async () => {
+        const now = new Date().toISOString();
+        const res = await upsert(vector, {
+          content, category: 'work', importance: 'critical',
+          tags: [domain, 'framework', `v${version}`],
+          memory_type: 'distilled', created_at: now,
+          source: 'synthesize-agent', session_key: 'agent',
+          hit_count: 0, last_accessed_at: null, status: 'active',
+          feedback_score: 1.0, level: LEVEL_WISDOM,
+          domain, topic, freshness_score: 1.0, decay_rate: 'slow',
+          last_verified: now, source_ids: sourceIds,
+          associated_ids: [], derived_to_id: null,
+          obsidian_path: l3Path, acquisition_source: 'synthesize-agent',
+        });
+        l3Id = res?.id;
+      });
+
+      // 7. Patch source L2 nodes: derived_to_id → l3Id
+      if (l3Id) {
+        await writeQueue.push(WRITE_PRIORITY.AGENT, () =>
+          httpReq(`${QDRANT}/collections/${COLLECTION}/points/payload`, 'POST',
+            { payload: { derived_to_id: l3Id }, points: sourceIds })
+        );
+      }
+
+      synthesized++;
+      appendEvolutionLog('SYNTHESIZE',
+        `L3框架: "${framework.title}" v${version} [${domain}] ← ${cluster.length}个L2洞见`
+      ).catch(() => {});
+      logger?.info?.(`[atlas-memory] 合成Agent: "${framework.title}" v${version} [${domain}]`);
+    }
+  }
+
+  logger?.info?.(`[atlas-memory] 合成Agent: 聚类${totalClusters}个，合成${synthesized}个L3`);
+  return { l2_scanned: l2Nodes.length, clusters: totalClusters, synthesized };
+}
+
 // ── 工具结果格式 ──────────────────────────────────────────────────────────────
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -1940,7 +2134,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase5 — 自主演化知识系统（L0-L3四层 · 整理/域检测/关联Agent · 跨域L1碰撞 · L2洞见 · wikilinks · atlas_organize · atlas_domain_detect · atlas_associate）';
+export const description = 'ATLAS Memory v10.0.0-phase6 — 自主演化知识系统（L0-L3四层 · 整理/域检测/关联/合成Agent · L2聚类→L3版本化框架 · DeepSeek合成 · atlas_organize · atlas_domain_detect · atlas_associate · atlas_synthesize）';
 
 export function register(api) {
   const logger = api.logger;
@@ -1960,6 +2154,9 @@ export function register(api) {
   // Phase 5：关联Agent（6h 周期 + 启动后 60s 首次触发，在域检测之后）
   setInterval(() => runAgent('associate', () => runAssociateAgent(logger)).catch(() => {}), ASSOCIATE_INTERVAL_MS);
   setTimeout(() => runAgent('associate', () => runAssociateAgent(logger)).catch(() => {}), 60_000);
+  // Phase 6：合成Agent（12h 周期 + 启动后 90s 首次触发）
+  setInterval(() => runAgent('synthesize', () => runSynthesizeAgent(logger)).catch(() => {}), SYNTHESIZE_INTERVAL_MS);
+  setTimeout(() => runAgent('synthesize', () => runSynthesizeAgent(logger)).catch(() => {}), 90_000);
 
   // Obsidian Bridge：每 6 小时自动刷新监控台
   if (OBSIDIAN_VAULT) {
@@ -2292,6 +2489,24 @@ export function register(api) {
         if (agentLocks.get('associate')) return jsonResult({ ok: false, reason: '关联Agent正在运行，请稍后重试' });
         const result = await new Promise((resolve, reject) => {
           runAgent('associate', () => runAssociateAgent(logger)).then(resolve).catch(reject);
+        });
+        return jsonResult({ ok: true, ...(result ?? {}) });
+      } catch (e) {
+        return jsonResult({ error: e.message });
+      }
+    },
+  }));
+
+  // atlas_synthesize（Phase 6）
+  api.registerTool(() => ({
+    name: 'atlas_synthesize',
+    description: '手动触发合成Agent：扫描L2洞见聚类（≥3），用DeepSeek合成L3智识框架，版本化写入Obsidian L3-智识/目录，更新L2节点derived_to_id。',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      try {
+        if (agentLocks.get('synthesize')) return jsonResult({ ok: false, reason: '合成Agent正在运行，请稍后重试' });
+        const result = await new Promise((resolve, reject) => {
+          runAgent('synthesize', () => runSynthesizeAgent(logger)).then(resolve).catch(reject);
         });
         return jsonResult({ ok: true, ...(result ?? {}) });
       } catch (e) {
