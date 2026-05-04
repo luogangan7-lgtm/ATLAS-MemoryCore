@@ -1,5 +1,5 @@
 /**
- * ATLAS Memory v10.0.0-phase2 — 自主演化知识系统（L0-L3 · WriteQueue · CAPTURE/LEARN统一入口 · inferDecayRate）
+ * ATLAS Memory v10.0.0-phase3 — 自主演化知识系统（L0-L3 · 整理Agent · 域向量匹配 · L1 Obsidian写入）
  *
  * 架构（四层，商业级）：
  *   INJECT  — LRU缓存 + 跳过短/重复 + 时间衰减 + 访问计数 + 注入 memory_type
@@ -128,6 +128,19 @@ const DOMAIN_DIRS = {
 };
 const LEVEL_DIRS = ['L0-原料', 'L1-知识', 'L2-关联', 'L3-智识'];
 
+// 域描述（用于向量匹配，整理Agent用）
+const DOMAIN_DESCRIPTIONS = {
+  '营销':        '营销策略 广告文案 品牌传播 流量获取 内容营销 用户转化 市场推广 促销活动 消费者心理',
+  '品牌项目':    '香氛品牌 产品开发 品牌策略 视觉设计 产品定位 包装设计 品牌故事 产品规划',
+  '情感学':      '情感关系 吸引力 搭讪 社交技巧 约会 恋爱 人际沟通 男女关系 吸引异性',
+  '战略':        '商业战略 竞争分析 市场定位 商业模式 长期规划 企业管理 决策框架 战略思维',
+  'TikTok运营':  'TikTok短视频 内容创作 算法 运营数据 海外社媒 粉丝增长 账号管理 视频剪辑',
+  '五金工具-电焊机': '五金工具 电焊机 工业设备 产品规格 焊接技术 工具选型 供应链 硬件产品',
+  '储能电池':    '储能电池 新能源 电力系统 电池技术 光伏储能 锂电池 能源管理 充放电',
+  'OKX交易':     'OKX 加密货币 比特币 以太坊 交易策略 数字资产 DeFi 区块链 行情分析',
+};
+const ORGANIZE_BATCH_MAX = 20; // 整理Agent每次处理上限
+
 // ── 运行时状态 ─────────────────────────────────────────────────────────────────
 const embedCache     = new Map();
 let embedCacheHits   = 0;
@@ -138,6 +151,7 @@ let lastInjectResult = undefined;
 let lastBackupTime   = null;
 let   lastInjectedIds        = [];             // ★ INJECT 注入的记忆 ID，供 feedback 定位
 const distillWrittenHashes   = new Set();      // ★ distill 已写入的 hash，阻止 CAPTURE 二次捕获
+const domainEmbeddingCache   = new Map();      // 域描述向量缓存（整理Agent）
 
 // ── WriteQueue（并发安全，P1=CAPTURE/LEARN，P2=Agent）────────────────────────
 class WriteQueue {
@@ -1315,6 +1329,157 @@ async function intakeToL0({ content, domain, topic, source = 'manual', tags = []
   });
 }
 
+// ── Phase 3：整理Agent（L0→L1）────────────────────────────────────────────────
+
+function cosine(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+}
+
+async function getDomainEmbeddings() {
+  const total = Object.keys(DOMAIN_DESCRIPTIONS).length;
+  if (domainEmbeddingCache.size >= total) return domainEmbeddingCache;
+  for (const [domain, desc] of Object.entries(DOMAIN_DESCRIPTIONS)) {
+    if (domainEmbeddingCache.has(domain)) continue;
+    const vec = await embed(desc);
+    if (vec) domainEmbeddingCache.set(domain, vec);
+  }
+  return domainEmbeddingCache;
+}
+
+async function matchDomainForVector(vector) {
+  const cache = await getDomainEmbeddings();
+  let best = null, bestScore = 0;
+  for (const [domain, domVec] of cache) {
+    const score = cosine(vector, domVec);
+    if (score > bestScore) { bestScore = score; best = domain; }
+  }
+  if (bestScore >= DOMAIN_MATCH_SCORE)    return { domain: best, score: bestScore };
+  if (bestScore >= DOMAIN_SUBDOMAIN_SCORE) return { domain: best, score: bestScore, weak: true };
+  return { domain: null, score: bestScore };
+}
+
+async function extractL1Content(content, domain) {
+  const sys = '你是知识整理专家。严格只输出有效JSON对象，不要任何解释或markdown代码块。';
+  const user =
+    `将以下原始知识整理为结构化L1知识节点。
+域：${domain ?? '通用'}
+原始内容：${content.slice(0, 2000)}
+
+输出JSON（字段不可省略）：
+{
+  "title": "简洁主题标题（10字以内）",
+  "summary": "3-5句话的知识摘要（保留核心观点，不要废话）",
+  "key_points": ["核心知识点1", "核心知识点2", "核心知识点3"],
+  "applicable_scenarios": "这些知识适用的实际场景（1-2句）",
+  "tags": ["标签1", "标签2", "标签3"]
+}`;
+  const out = await omlxGenerate(sys, user, 700);
+  if (!out) return null;
+  return parseJsonObject(out);
+}
+
+async function writeL1Obsidian(domain, topic, l1Data, sourceL0Path) {
+  if (!OBSIDIAN_VAULT) return null;
+  const domainDir = DOMAIN_DIRS[domain] ?? '_未分类';
+  const l1Dir     = domain ? join(OBSIDIAN_VAULT, domainDir, 'L1-知识') : join(OBSIDIAN_VAULT, '_未分类');
+  await mkdir(l1Dir, { recursive: true });
+  const slug     = topic.replace(/[/\\:*?"<>|]/g, '-').slice(0, 50);
+  const filename = `${slug}.md`;
+  const lines = [
+    '---',
+    `level: L1`,
+    `domain: ${domain ?? '未分类'}`,
+    `topic: ${topic}`,
+    `source_l0: ${sourceL0Path ?? ''}`,
+    `created: ${new Date().toISOString()}`,
+    `tags: [${(l1Data.tags ?? []).map(t => `"${t}"`).join(', ')}]`,
+    '---',
+    '',
+    `# ${l1Data.title ?? topic}`,
+    '',
+    '## 知识摘要',
+    l1Data.summary ?? '',
+    '',
+    '## 核心知识点',
+    ...(l1Data.key_points ?? []).map(p => `- ${p}`),
+    '',
+    '## 适用场景',
+    l1Data.applicable_scenarios ?? '',
+    '',
+  ];
+  await writeFile(join(l1Dir, filename), lines.join('\n'), 'utf8');
+  return domain ? `${domainDir}/L1-知识/${filename}` : `_未分类/${filename}`;
+}
+
+async function runOrganizeAgent(logger) {
+  // 1. 拉取 level=0 的记录（含向量）
+  let offset = null;
+  const l0Points = [];
+  do {
+    const body = {
+      limit: 50, with_payload: true, with_vector: true,
+      filter: { must: [{ key: 'level', match: { value: LEVEL_RAW } }] },
+    };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    l0Points.push(...(r.body?.result?.points ?? []));
+    offset = r.body?.result?.next_page_offset ?? null;
+    if (l0Points.length >= ORGANIZE_BATCH_MAX) break;
+  } while (offset != null);
+
+  if (!l0Points.length) {
+    logger?.debug?.('[atlas-memory] 整理Agent: 无L0待处理记录');
+    return { processed: 0, promoted: 0, skipped: 0 };
+  }
+
+  logger?.info?.(`[atlas-memory] 整理Agent: 处理 ${l0Points.length} 条L0记录`);
+  let promoted = 0, skipped = 0;
+
+  for (const pt of l0Points) {
+    const content = pt.payload?.content;
+    if (!content?.trim() || !pt.vector) { skipped++; continue; }
+
+    // 2. 域匹配
+    const match  = await matchDomainForVector(pt.vector);
+    const domain = match.domain;
+
+    // 3. omlx 提取 L1 结构化内容
+    const l1Data = await extractL1Content(content, domain).catch(() => null);
+    if (!l1Data?.title || !l1Data?.summary) { skipped++; continue; }
+
+    const topic = l1Data.title;
+    const tags  = [...new Set([...(l1Data.tags ?? []), ...(pt.payload?.tags ?? [])])];
+
+    // 4. 写 Obsidian L1 文件
+    const obsidianPath = await writeL1Obsidian(domain, topic, l1Data, pt.payload?.obsidian_path)
+      .catch(() => null);
+
+    // 5. 更新 Qdrant：level→1，domain，topic，obsidian_path
+    const now = new Date().toISOString();
+    await writeQueue.push(WRITE_PRIORITY.AGENT, async () => {
+      await qdrantPatchPayload(pt.id, {
+        level:          LEVEL_KNOWLEDGE,
+        domain,
+        topic,
+        tags,
+        obsidian_path:  obsidianPath,
+        last_verified:  now,
+        freshness_score: 1.0,
+        decay_rate:     inferDecayRate(domain, tags),
+      });
+    });
+
+    promoted++;
+    appendEvolutionLog('ORGANIZE', `L0→L1: "${topic}" → [${domain ?? '未分类'}] (匹配度${match.score.toFixed(2)})`).catch(() => {});
+  }
+
+  logger?.info?.(`[atlas-memory] 整理Agent: 晋升${promoted}条, 跳过${skipped}条`);
+  return { processed: l0Points.length, promoted, skipped };
+}
+
 // ── 工具结果格式 ──────────────────────────────────────────────────────────────
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -1322,7 +1487,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase2 — 自主演化知识系统（L0-L3四层 · CAPTURE/LEARN统一L0入口 · inferDecayRate · freshness过滤）';
+export const description = 'ATLAS Memory v10.0.0-phase3 — 自主演化知识系统（L0-L3四层 · 整理Agent · 域向量匹配 · L1-Obsidian写入 · atlas_organize工具）';
 
 export function register(api) {
   const logger = api.logger;
@@ -1332,6 +1497,9 @@ export function register(api) {
     .catch(() => {});
   setInterval(() => runEvolution(logger).catch(() => {}), 24 * 60 * 60 * 1000);
   setInterval(() => backupCollection(logger).catch(() => {}), 7 * 24 * 60 * 60 * 1000);
+  // Phase 3：整理Agent（1h 周期 + 启动后 10s 首次触发）
+  setInterval(() => runAgent('organize', () => runOrganizeAgent(logger)).catch(() => {}), ORGANIZE_INTERVAL_MS);
+  setTimeout(() => runAgent('organize', () => runOrganizeAgent(logger)).catch(() => {}), 10_000);
 
   // Obsidian Bridge：每 6 小时自动刷新监控台
   if (OBSIDIAN_VAULT) {
@@ -1612,6 +1780,24 @@ export function register(api) {
       try {
         const result = await runEvolution(logger);
         return jsonResult({ ok: true, ...result });
+      } catch (e) {
+        return jsonResult({ error: e.message });
+      }
+    },
+  }));
+
+  // atlas_organize（Phase 3）
+  api.registerTool(() => ({
+    name: 'atlas_organize',
+    description: '手动触发整理Agent：将L0原料晋升为L1知识，自动域归类，写入Obsidian L1文件。每次最多处理20条。',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      try {
+        if (agentLocks.get('organize')) return jsonResult({ ok: false, reason: '整理Agent正在运行，请稍后重试' });
+        const result = await new Promise((resolve, reject) => {
+          runAgent('organize', () => runOrganizeAgent(logger)).then(resolve).catch(reject);
+        });
+        return jsonResult({ ok: true, ...(result ?? {}) });
       } catch (e) {
         return jsonResult({ error: e.message });
       }
