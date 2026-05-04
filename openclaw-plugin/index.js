@@ -36,7 +36,7 @@
 import http from 'http';
 import https from 'https';
 import { createHash } from 'crypto';
-import { writeFile, readFile, mkdir, appendFile } from 'fs/promises';
+import { writeFile, readFile, mkdir, appendFile, unlink } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -1481,6 +1481,222 @@ async function runOrganizeAgent(logger) {
   return { processed: l0Points.length, promoted, skipped };
 }
 
+// ── Phase 4：域检测Agent ──────────────────────────────────────────────────────
+
+function centroid(vectors) {
+  if (!vectors.length) return null;
+  const dim = vectors[0].length;
+  const sum = new Array(dim).fill(0);
+  for (const v of vectors) for (let i = 0; i < dim; i++) sum[i] += v[i];
+  const len = vectors.length;
+  return sum.map(x => x / len);
+}
+
+function clusterNodes(nodes, minSim = CLUSTER_MIN_SCORE, minSize = CLUSTER_MIN_SIZE) {
+  // Greedy threshold clustering: first unclustered node becomes seed
+  const clusters = [];
+  const assigned = new Set();
+
+  for (let i = 0; i < nodes.length; i++) {
+    if (assigned.has(i)) continue;
+    const cluster = [i];
+    assigned.add(i);
+    for (let j = i + 1; j < nodes.length; j++) {
+      if (assigned.has(j)) continue;
+      if (cosine(nodes[i].vector, nodes[j].vector) >= minSim) {
+        cluster.push(j);
+        assigned.add(j);
+      }
+    }
+    if (cluster.length >= minSize) clusters.push(cluster.map(idx => nodes[idx]));
+  }
+  return clusters;
+}
+
+async function inferNewDomain(samples) {
+  const excerpts = samples.slice(0, 5).map((s, i) => `${i + 1}. ${s.payload?.content?.slice(0, 120) ?? ''}`).join('\n');
+  const sys = '你是知识分类专家。严格输出JSON，不要解释，不要markdown代码块。';
+  const user =
+    `以下是同一知识簇中的记忆样本：\n${excerpts}\n\n` +
+    `请推断这个知识簇属于什么业务域，输出：\n` +
+    `{"domain_name":"不超过6个汉字的域名","description":"一句话描述（15-30字）",` +
+    `"dimensions":["维度1","维度2","维度3"],"keywords":["关键词1","关键词2","关键词3","关键词4","关键词5"]}`;
+
+  const raw = await deepseekGenerate(sys, user, 400);
+  if (!raw) return null;
+  try {
+    const cleaned = raw.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+    if (!parsed.domain_name || !parsed.description) return null;
+    parsed.dimensions = Array.isArray(parsed.dimensions) ? parsed.dimensions.slice(0, 5) : [];
+    parsed.keywords   = Array.isArray(parsed.keywords)   ? parsed.keywords.slice(0, 8)   : [];
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function createDomainStructure(domainName, domainInfo) {
+  if (!OBSIDIAN_VAULT) return null;
+  const domainDir = join(OBSIDIAN_VAULT, domainName);
+  for (const level of LEVEL_DIRS) {
+    await mkdir(join(domainDir, level), { recursive: true });
+    // ensure .gitkeep
+    const kp = join(domainDir, level, '.gitkeep');
+    try { await writeFile(kp, '', 'utf8'); } catch {}
+  }
+
+  // Write dimension map
+  const dims  = (domainInfo.dimensions ?? []).map(d => `- ${d}`).join('\n');
+  const kws   = (domainInfo.keywords ?? []).map(k => `#${k}`).join(' ');
+  const now   = new Date().toISOString();
+  const mapMd = [
+    '---',
+    `domain: ${domainName}`,
+    `description: ${domainInfo.description ?? ''}`,
+    `created: ${now}`,
+    `auto_detected: true`,
+    '---',
+    '',
+    `# ${domainName} · 维度图谱`,
+    '',
+    `> ${domainInfo.description ?? ''}`,
+    '',
+    '## 核心维度',
+    dims,
+    '',
+    '## 关键词',
+    kws,
+    '',
+    '## 层级结构',
+    '- [[L0-原料]] — 原始信息、未加工片段',
+    '- [[L1-知识]] — 经过整理的知识点',
+    '- [[L2-关联]] — 跨域关联洞见',
+    '- [[L3-智识]] — 提炼的高阶原则',
+  ].join('\n');
+
+  await writeFile(join(domainDir, '_维度图谱.md'), mapMd, 'utf8');
+  return `${domainName}/_维度图谱.md`;
+}
+
+async function runDomainDetectAgent(logger) {
+  // 1. Scroll all domain=null active records with vectors
+  const unassigned = [];
+  let offset = null;
+  do {
+    const body = {
+      limit: 500,
+      with_payload: true,
+      with_vector: true,
+      filter: { must: [{ is_null: { key: 'domain' } }, { must_not: [{ match: { key: 'status', value: 'superseded' } }] }] },
+    };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    const pts = r.body?.result?.points ?? [];
+    unassigned.push(...pts);
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset != null);
+
+  if (unassigned.length < CLUSTER_MIN_SIZE) {
+    logger?.info?.(`[atlas-memory] 域检测Agent: 未分类记录${unassigned.length}条，未达聚类最低${CLUSTER_MIN_SIZE}条，跳过`);
+    return { checked: unassigned.length, clusters_found: 0, new_domains: 0, assigned: 0 };
+  }
+
+  logger?.info?.(`[atlas-memory] 域检测Agent: 扫描${unassigned.length}条未分类记录`);
+
+  // 2. Cluster
+  const clusters = clusterNodes(unassigned);
+  logger?.info?.(`[atlas-memory] 域检测Agent: 聚类${clusters.length}个`);
+
+  let newDomains = 0;
+  let assigned = 0;
+
+  for (const cluster of clusters) {
+    const vectors = cluster.map(n => n.vector);
+    const c = centroid(vectors);
+
+    // 3. Compare centroid against existing domains
+    const match = await matchDomainForVector(c);
+
+    let targetDomain;
+    if (match.domain && match.score >= DOMAIN_MATCH_SCORE) {
+      // Assign to existing domain
+      targetDomain = match.domain;
+    } else {
+      // 4. Infer new domain via DeepSeek
+      const domainInfo = await inferNewDomain(cluster);
+      if (!domainInfo) continue;
+
+      const newName = domainInfo.domain_name;
+      if (DOMAIN_DIRS[newName]) {
+        // Race condition: domain was just created; just assign
+        targetDomain = newName;
+      } else {
+        // Create directory + map
+        await createDomainStructure(newName, domainInfo);
+
+        // 5. Update runtime caches
+        DOMAIN_DIRS[newName] = newName;
+        DOMAIN_DESCRIPTIONS[newName] = domainInfo.description;
+        const vec = await embed(domainInfo.description);
+        if (vec) domainEmbeddingCache.set(newName, vec);
+
+        targetDomain = newName;
+        newDomains++;
+
+        appendEvolutionLog('DOMAIN_NEW',
+          `新域: "${newName}" — ${domainInfo.description} (从${cluster.length}条记录聚类发现)`
+        ).catch(() => {});
+        logger?.info?.(`[atlas-memory] 域检测Agent: 新域 "${newName}"`);
+      }
+    }
+
+    // 6. Patch all nodes in cluster → target domain (batch via raw HTTP)
+    const now = new Date().toISOString();
+    await writeQueue.push(WRITE_PRIORITY.AGENT, async () => {
+      const ids = cluster.map(n => n.id);
+      await httpReq(
+        `${QDRANT}/collections/${COLLECTION}/points/payload`, 'POST',
+        { payload: { domain: targetDomain, last_verified: now }, points: ids },
+      );
+    });
+
+    // Also move Obsidian file if obsidian_path exists and is in _未分类
+    for (const node of cluster) {
+      const op = node.payload?.obsidian_path;
+      if (op && op.startsWith('_未分类/') && OBSIDIAN_VAULT) {
+        const src = join(OBSIDIAN_VAULT, op);
+        const filename = op.split('/').pop();
+        const destDir = join(OBSIDIAN_VAULT, targetDomain, 'L0-原料');
+        await mkdir(destDir, { recursive: true });
+        const dest = join(destDir, filename);
+        try {
+          const content = await readFile(src, 'utf8').catch(() => null);
+          if (content) {
+            // Update domain field in frontmatter
+            const updated = content.replace(/^domain: 未分类$/m, `domain: ${targetDomain}`);
+            await writeFile(dest, updated, 'utf8');
+            await unlink(src).catch(() => {});
+            const newPath = `${targetDomain}/L0-原料/${filename}`;
+            await writeQueue.push(WRITE_PRIORITY.AGENT, () =>
+              qdrantPatchPayload(node.id, { obsidian_path: newPath })
+            );
+          }
+        } catch {}
+      }
+    }
+
+    assigned += cluster.length;
+    appendEvolutionLog('DOMAIN_ASSIGN',
+      `域归属: "${targetDomain}" ← ${cluster.length}条 (相似度${match.score?.toFixed(2) ?? 'new'})`
+    ).catch(() => {});
+  }
+
+  logger?.info?.(`[atlas-memory] 域检测Agent: 新域${newDomains}个, 归属${assigned}条`);
+  return { checked: unassigned.length, clusters_found: clusters.length, new_domains: newDomains, assigned };
+}
+
 // ── 工具结果格式 ──────────────────────────────────────────────────────────────
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -1488,7 +1704,7 @@ function jsonResult(payload) {
 
 // ── 插件注册 ──────────────────────────────────────────────────────────────────
 export const name        = 'atlas-memory';
-export const description = 'ATLAS Memory v10.0.0-phase3 — 自主演化知识系统（L0-L3四层 · 整理Agent · 域向量匹配 · L1-Obsidian写入 · atlas_organize工具）';
+export const description = 'ATLAS Memory v10.0.0-phase4 — 自主演化知识系统（L0-L3四层 · 整理Agent · 域检测Agent · 向量聚类 · DeepSeek域推断 · Obsidian维度图谱 · atlas_organize · atlas_domain_detect）';
 
 export function register(api) {
   const logger = api.logger;
@@ -1501,6 +1717,9 @@ export function register(api) {
   // Phase 3：整理Agent（1h 周期 + 启动后 10s 首次触发）
   setInterval(() => runAgent('organize', () => runOrganizeAgent(logger)).catch(() => {}), ORGANIZE_INTERVAL_MS);
   setTimeout(() => runAgent('organize', () => runOrganizeAgent(logger)).catch(() => {}), 10_000);
+  // Phase 4：域检测Agent（6h 周期 + 启动后 30s 首次触发）
+  setInterval(() => runAgent('domain', () => runDomainDetectAgent(logger)).catch(() => {}), DOMAIN_INTERVAL_MS);
+  setTimeout(() => runAgent('domain', () => runDomainDetectAgent(logger)).catch(() => {}), 30_000);
 
   // Obsidian Bridge：每 6 小时自动刷新监控台
   if (OBSIDIAN_VAULT) {
@@ -1797,6 +2016,24 @@ export function register(api) {
         if (agentLocks.get('organize')) return jsonResult({ ok: false, reason: '整理Agent正在运行，请稍后重试' });
         const result = await new Promise((resolve, reject) => {
           runAgent('organize', () => runOrganizeAgent(logger)).then(resolve).catch(reject);
+        });
+        return jsonResult({ ok: true, ...(result ?? {}) });
+      } catch (e) {
+        return jsonResult({ error: e.message });
+      }
+    },
+  }));
+
+  // atlas_domain_detect（Phase 4）
+  api.registerTool(() => ({
+    name: 'atlas_domain_detect',
+    description: '手动触发域检测Agent：对domain=null的未分类记录做向量聚类，自动推断新域名（DeepSeek），创建Obsidian目录+维度图谱，更新Qdrant域字段。',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      try {
+        if (agentLocks.get('domain')) return jsonResult({ ok: false, reason: '域检测Agent正在运行，请稍后重试' });
+        const result = await new Promise((resolve, reject) => {
+          runAgent('domain', () => runDomainDetectAgent(logger)).then(resolve).catch(reject);
         });
         return jsonResult({ ok: true, ...(result ?? {}) });
       } catch (e) {
