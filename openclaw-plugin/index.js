@@ -36,7 +36,7 @@
 import http from 'http';
 import https from 'https';
 import { createHash } from 'crypto';
-import { writeFile, readFile, mkdir, appendFile, unlink } from 'fs/promises';
+import { writeFile, readFile, mkdir, appendFile, unlink, rename, readdir, rmdir } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -105,8 +105,15 @@ const LEVEL_WISDOM       = 3;  // L3 智识
 const ORGANIZE_INTERVAL_MS   = 60 * 60 * 1000;         // 1h
 const DOMAIN_INTERVAL_MS     = 6 * 60 * 60 * 1000;     // 6h
 const ASSOCIATE_INTERVAL_MS  = 6 * 60 * 60 * 1000;     // 6h
-const SYNTHESIZE_INTERVAL_MS = 12 * 60 * 60 * 1000;    // 12h
-const META_INTERVAL_MS       = 24 * 60 * 60 * 1000;    // 24h
+const SYNTHESIZE_INTERVAL_MS    = 12 * 60 * 60 * 1000;    // 12h
+const META_INTERVAL_MS          = 24 * 60 * 60 * 1000;    // 24h
+const RESTRUCTURE_INTERVAL_MS   = 7  * 24 * 60 * 60 * 1000; // 7天
+const MERGE_SIM_THRESHOLD       = 0.88;  // 域质心相似度超过此值 → 合并候选
+const SPLIT_COHESION_THRESHOLD  = 0.55;  // 域内聚度低于此值 → 分裂候选
+const SPLIT_MIN_NODES           = 25;    // 分裂最小节点数
+const RESTRUCTURE_MAX_MERGES    = 2;     // 每轮最多合并次数
+const RESTRUCTURE_MAX_SPLITS    = 1;     // 每轮最多分裂次数
+const RESTRUCTURE_MIN_NODES     = 5;     // 参与分析的域最小节点数
 
 const FRESHNESS_REFRESH      = 0.40;  // 低于此值重新验证
 const FRESHNESS_INJECT_MIN   = 0.20;  // 低于此值不注入
@@ -2502,6 +2509,204 @@ async function runMetaAgent(logger) {
   return { date, freshness, domains: domainStats.length, planItems: plan.length, acquired };
 }
 
+// ── Phase 12: 结构重组Agent ───────────────────────────────────────────────────
+
+async function fetchDomainNodeVectors(domain, limit = 100) {
+  const body = {
+    limit, with_payload: true, with_vector: true,
+    filter: {
+      must: [
+        { key: 'domain', match: { value: domain } },
+        { key: 'status', match: { value: 'active' } },
+      ],
+      must_not: [{ key: 'level', match: { value: LEVEL_RAW } }],
+    },
+  };
+  const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+  if (!r.ok) return [];
+  return (r.body?.result?.points ?? []).map(p => ({
+    id: p.id,
+    vector: p.vector,
+    obsidian_path: p.payload?.obsidian_path ?? null,
+    level: p.payload?.level ?? 1,
+  }));
+}
+
+function calcCohesion(vectors) {
+  if (vectors.length < 2) return 1.0;
+  const c = centroid(vectors);
+  return vectors.reduce((sum, v) => sum + cosine(v, c), 0) / vectors.length;
+}
+
+async function patchDomainNodes(srcDomain, dstDomain) {
+  let offset = null;
+  const ids = [];
+  do {
+    const body = { limit: 256, with_payload: false, with_vector: false,
+      filter: { must: [{ key: 'domain', match: { value: srcDomain } }] } };
+    if (offset) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    ids.push(...(r.body?.result?.points ?? []).map(p => p.id));
+    offset = r.body?.result?.next_page_offset ?? null;
+  } while (offset);
+
+  for (let i = 0; i < ids.length; i += 100) {
+    await httpReq(`${QDRANT}/collections/${COLLECTION}/points/payload`, 'POST', {
+      payload: { domain: dstDomain }, points: ids.slice(i, i + 100),
+    });
+  }
+  return ids.length;
+}
+
+async function moveObsidianDomainFiles(srcDir, dstDir, logger) {
+  if (!OBSIDIAN_VAULT || !srcDir || !dstDir) return;
+  const src = join(OBSIDIAN_VAULT, srcDir);
+  const dst = join(OBSIDIAN_VAULT, dstDir);
+  try {
+    await mkdir(dst, { recursive: true });
+    const entries = await readdir(src, { withFileTypes: true }).catch(() => []);
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const s = join(src, e.name), d = join(dst, e.name);
+      await rename(s, d).catch(() => {});
+    }
+    await rmdir(src).catch(() => {});
+  } catch (e) {
+    logger?.info?.(`[atlas-memory] 重组：文件移动失败 ${e.message}`);
+  }
+}
+
+async function writeRestructureLog(date, actions) {
+  if (!OBSIDIAN_VAULT || !actions.length) return;
+  const dir = join(OBSIDIAN_VAULT, '_系统', '重组日志');
+  await mkdir(dir, { recursive: true });
+  const content = `# 结构重组日志 ${date}\n\n${actions.map(a => `- ${a}`).join('\n')}\n`;
+  await writeFile(join(dir, `${date}.md`), content, 'utf8').catch(() => {});
+}
+
+async function runRestructureAgent(logger) {
+  const domains = Object.keys(DOMAIN_DIRS);
+  if (domains.length < 2) {
+    logger?.info?.('[atlas-memory] 重组Agent: 域数量不足，跳过');
+    return { merges: 0, splits: 0 };
+  }
+
+  logger?.info?.('[atlas-memory] 重组Agent: 开始结构分析...');
+
+  // 获取各域节点向量
+  const domainData = {};
+  await Promise.all(domains.map(async d => {
+    const nodes = await fetchDomainNodeVectors(d, 100);
+    const vecs = nodes.map(n => n.vector).filter(Boolean);
+    domainData[d] = { nodes, vecs, count: nodes.length };
+  }));
+
+  const active = domains.filter(d => domainData[d].count >= RESTRUCTURE_MIN_NODES);
+  logger?.info?.(`[atlas-memory] 重组Agent: 活跃域 ${active.length}/${domains.length}`);
+
+  const actions = [];
+  let merges = 0, splits = 0;
+  const date = new Date().toISOString().slice(0, 10);
+
+  // ── 1. 合并检测 ────────────────────────────────────────────────────
+  const cents = {};
+  for (const d of active) {
+    if (domainData[d].vecs.length >= 2) cents[d] = centroid(domainData[d].vecs);
+  }
+
+  const mergeCandidates = [];
+  const dList = active.filter(d => cents[d]);
+  for (let i = 0; i < dList.length; i++) {
+    for (let j = i + 1; j < dList.length; j++) {
+      const sim = cosine(cents[dList[i]], cents[dList[j]]);
+      if (sim >= MERGE_SIM_THRESHOLD)
+        mergeCandidates.push({ a: dList[i], b: dList[j], sim });
+    }
+  }
+  mergeCandidates.sort((x, y) => y.sim - x.sim);
+
+  const merged = new Set();
+  for (const mc of mergeCandidates) {
+    if (merges >= RESTRUCTURE_MAX_MERGES) break;
+    if (merged.has(mc.a) || merged.has(mc.b)) continue;
+
+    const [src, dst] = domainData[mc.a].count <= domainData[mc.b].count
+      ? [mc.a, mc.b] : [mc.b, mc.a];
+
+    logger?.info?.(`[atlas-memory] 重组：合并 "${src}" → "${dst}" sim=${mc.sim.toFixed(3)}`);
+    const patched = await patchDomainNodes(src, dst);
+    await moveObsidianDomainFiles(DOMAIN_DIRS[src], DOMAIN_DIRS[dst], logger);
+    await writeDomainIndex(dst, { l0: 0, l1: domainData[dst].count + patched, l2: 0, l3: 0 }).catch(() => {});
+
+    delete DOMAIN_DIRS[src];
+    delete DOMAIN_DESCRIPTIONS[src];
+    domainEmbeddingCache.delete(src);
+
+    appendEvolutionLog('RESTRUCTURE', `合并: "${src}" → "${dst}" ${patched}条 sim=${mc.sim.toFixed(3)}`).catch(() => {});
+    actions.push(`合并: \`${src}\`(${domainData[src].count}条) → \`${dst}\` (相似度=${mc.sim.toFixed(3)})`);
+    merged.add(src);
+    merges++;
+  }
+
+  // ── 2. 分裂检测 ────────────────────────────────────────────────────
+  const splitCandidates = [];
+  for (const d of active) {
+    if (merged.has(d)) continue;
+    const vecs = domainData[d].vecs;
+    if (vecs.length < SPLIT_MIN_NODES) continue;
+    const cohesion = calcCohesion(vecs);
+    if (cohesion < SPLIT_COHESION_THRESHOLD)
+      splitCandidates.push({ domain: d, cohesion, nodes: domainData[d].nodes });
+  }
+  splitCandidates.sort((x, y) => x.cohesion - y.cohesion);
+
+  for (const sc of splitCandidates) {
+    if (splits >= RESTRUCTURE_MAX_SPLITS) break;
+
+    const items = sc.nodes.filter(n => n.vector).map(n => ({ ...n, embedding: n.vector }));
+    const clusters = clusterNodes(items, 0.72, 5);
+    if (clusters.length < 2) continue;
+
+    // DeepSeek 命名新子域
+    const sampleA = clusters[0].slice(0, 3).map(n => n.obsidian_path?.split('/').pop() ?? n.id).join(', ');
+    const sampleB = clusters[1].slice(0, 3).map(n => n.obsidian_path?.split('/').pop() ?? n.id).join(', ');
+    const prompt = `域名:"${sc.domain}" 内聚度过低需分裂。\n子域A样本:${sampleA}\n子域B样本:${sampleB}\n为两子域各取简洁中文名(4-8字)。只输出JSON:{"nameA":"...","nameB":"..."}`;
+
+    let nameA = `${sc.domain}-A`, nameB = `${sc.domain}-B`;
+    try {
+      const raw = await deepseekGenerate(prompt, 80);
+      const m = raw.match(/\{[^}]+\}/);
+      if (m) { const p = JSON.parse(m[0]); nameA = p.nameA || nameA; nameB = p.nameB || nameB; }
+    } catch (_) {}
+
+    logger?.info?.(`[atlas-memory] 重组：分裂 "${sc.domain}" → "${nameA}" + "${nameB}" cohesion=${sc.cohesion.toFixed(3)}`);
+
+    await createDomainStructure(nameA, { description: `${sc.domain}子域A`, dimensions: [], keywords: [] });
+    await createDomainStructure(nameB, { description: `${sc.domain}子域B`, dimensions: [], keywords: [] });
+
+    const patchBatch = async (ids, domain) => {
+      for (let i = 0; i < ids.length; i += 100)
+        await httpReq(`${QDRANT}/collections/${COLLECTION}/points/payload`, 'POST',
+          { payload: { domain }, points: ids.slice(i, i + 100) });
+    };
+    await patchBatch(clusters[0].map(n => n.id), nameA);
+    await patchBatch(clusters[1].map(n => n.id), nameB);
+
+    delete DOMAIN_DIRS[sc.domain];
+    delete DOMAIN_DESCRIPTIONS[sc.domain];
+    domainEmbeddingCache.delete(sc.domain);
+
+    appendEvolutionLog('RESTRUCTURE', `分裂: "${sc.domain}" → "${nameA}"+"${nameB}" cohesion=${sc.cohesion.toFixed(3)}`).catch(() => {});
+    actions.push(`分裂: \`${sc.domain}\`(${sc.nodes.length}条) → \`${nameA}\` + \`${nameB}\` (内聚度=${sc.cohesion.toFixed(3)})`);
+    splits++;
+  }
+
+  if (actions.length) await writeRestructureLog(date, actions).catch(() => {});
+  logger?.info?.(`[atlas-memory] 重组Agent完成: 合并${merges}次, 分裂${splits}次`);
+  return { merges, splits, actions };
+}
+
 // ── 工具结果格式 ──────────────────────────────────────────────────────────────
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -2781,6 +2986,8 @@ export function register(api) {
     setInterval(() => runLayeredExport(logger).catch(() => {}), MIRROR_EXPORT_INTERVAL);
     setTimeout(() => runLayeredExport(logger).catch(() => {}), 15_000);
   }
+  // Phase 12：结构重组Agent（7天周期，不主动触发首次，等数据积累）
+  setInterval(() => runAgent('restructure', () => runRestructureAgent(logger)).catch(() => {}), RESTRUCTURE_INTERVAL_MS);
 
   // ══════════════════════════════════════════════════════════════════════════════
   // INJECT
@@ -3520,6 +3727,29 @@ ${content}
           is_distilled: (h.payload?.tags ?? []).includes(DISTILL_TAG),
         })),
       });
+    },
+  }));
+
+  // atlas_restructure — Phase 12：结构重组Agent
+  api.registerTool(() => ({
+    name: 'atlas_restructure',
+    description:
+      '手动触发结构重组Agent（Phase 12）：' +
+      '①检测语义高度重叠的域（质心相似度≥0.88）并合并；' +
+      '②检测内聚度过低的域（<0.55）并用 DeepSeek 命名后分裂；' +
+      '③更新 Qdrant + Obsidian + 运行时缓存。每次最多合并2次、分裂1次。',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      try {
+        if (agentLocks.get('restructure'))
+          return jsonResult({ ok: false, reason: '重组Agent正在运行，请稍后重试' });
+        const result = await new Promise((resolve, reject) =>
+          runAgent('restructure', () => runRestructureAgent(logger)).then(resolve).catch(reject)
+        );
+        return jsonResult({ ok: true, ...(result ?? {}) });
+      } catch (e) {
+        return jsonResult({ error: e.message });
+      }
     },
   }));
 }
