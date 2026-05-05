@@ -1,5 +1,5 @@
 /**
- * ATLAS Memory v12.0.0 — 多域自主演化知识系统（实体注册 · 关系图 · 多域 · 置信演化 · DeepSeek · MCP:8766）
+ * ATLAS Memory v10.0.0 — 自主演化知识系统（L0-L3 · 5Agent全自治 · MCP Server:8765 · 结构重组Agent）
  *
  * 架构（四层，商业级）：
  *   INJECT  — LRU缓存 + 跳过短/重复 + 时间衰减 + 访问计数 + 注入 memory_type
@@ -45,7 +45,7 @@ const QDRANT               = 'http://127.0.0.1:6333';
 const OLLAMA               = 'http://127.0.0.1:11434';
 const OMLX                 = 'http://127.0.0.1:7749';
 const OMLX_MODEL           = 'Qwen3.5-9B-OptiQ-4bit';
-const COLLECTION           = 'atlas_memories_v2';
+const COLLECTION           = 'atlas_memories';
 const EMBED_MODEL          = 'bge-m3';
 const VECTOR_DIM           = 1024;
 const SCORE_MIN            = 0.65;
@@ -128,41 +128,8 @@ const CLUSTER_MIN_SCORE      = 0.70;
 const ASSOC_MIN_SCORE        = 0.65;  // 关联搜索下界
 const ASSOC_MAX_SCORE        = 0.85;  // 关联搜索上界（避开直接重复）
 const DECAY_HALF_LIFE        = { fast: 7, medium: 30, slow: 180 }; // 单位：天
-const MCP_PORT               = parseInt(process.env.ATLAS_MCP_PORT ?? '8766');
+const MCP_PORT               = parseInt(process.env.ATLAS_MCP_PORT ?? '8765');
 const GITHUB_REPO            = process.env.ATLAS_GITHUB_REPO ?? '';
-
-// ── v11 信息源类型 & TTL ──────────────────────────────────────────────────────
-const SOURCE_TYPES = ['trading', 'news', 'social', 'course', 'chat', 'platform_rule', 'process', 'unknown'];
-
-const TTL_MAP = {
-  trading:       5 * 60,              // 5分钟（秒）
-  news:          3 * 24 * 3600,       // 3天
-  social:        7 * 24 * 3600,       // 7天
-  chat:          7 * 24 * 3600,       // 7天
-  platform_rule: 90 * 24 * 3600,     // 90天
-  course:        null,                // 永久
-  process:       null,                // 永久
-  unknown:       30 * 24 * 3600,     // 30天
-};
-
-// 按 source_type 设不同最小捕获字符数
-const MIN_CAPTURE_CHARS_MAP = {
-  trading:       5,
-  news:          30,
-  social:        20,
-  chat:          10,
-  platform_rule: 50,
-  course:        150,
-  process:       80,
-  unknown:       80,
-};
-
-// 知识颗粒度方向
-const KNOWLEDGE_PURPOSE = {
-  UNDERSTANDING: 'understanding',  // 课程学习，深度内化
-  PRODUCTION:    'production',     // 内容生产，模板化，可直接使用
-  PROCESS:       'process',        // 流程SOP，按步骤执行
-};
 
 // 域目录映射（L1/ 下的域文件夹名）
 const DOMAIN_DIRS = {
@@ -188,40 +155,6 @@ const DOMAIN_DESCRIPTIONS = {
   '其他学习':    '通用知识 学习资料 个人成长 技能提升 工具方法 其他领域 综合学习 知识积累',
 };
 const ORGANIZE_BATCH_MAX = 100; // 整理Agent每次处理上限
-
-// ── v12 多模态知识库常量 ────────────────────────────────────────────────────────
-const RECORD_TYPES = { KNOWLEDGE: 'knowledge', ENTITY: 'entity', RELATION: 'relation' };
-
-const RELATION_TYPES = {
-  SUPPORTS:     'supports',
-  CONTRADICTS:  'contradicts',
-  EXTENDS:      'extends',
-  DEPENDS_ON:   'depends_on',
-  USED_IN:      'used_in',
-  EVOLVED_FROM: 'evolved_from',
-  CROSS_DOMAIN: 'cross_domain',
-};
-
-const EMBED_SAFE_CHARS   = 6000;  // bge-m3 8192 token ≈ 6000中文字符安全上限
-const CONFIDENCE_DEFAULT = 0.6;   // 新知识默认置信度
-
-// 新增域（扩展 DOMAIN_DESCRIPTIONS，启动时合并）
-const NEW_DOMAIN_DESCRIPTIONS = {
-  '短视频生产': '短视频脚本 剪辑 钩子 开场 爆款 拍摄 BGM 字幕 封面 完播率',
-  '自动化工具': '自动化 脚本 工作流 OpenClaw Claude API MCP 效率工具 代码',
-  '人际沟通':   '微信聊天 话术 谈判 说服 客户沟通 回复模板 关系维护',
-  '交易投资':   '加密货币 比特币 以太坊 交易信号 行情 止损 止盈 仓位 DeFi',
-  '新闻热点':   '热搜 突发 今日热点 实时资讯 社会动态 行业新闻',
-};
-Object.assign(DOMAIN_DESCRIPTIONS, NEW_DOMAIN_DESCRIPTIONS);
-
-const FRAGMENT_SIGNALS = [
-  /第[一二三四五六七八九十\d]+[\/\-]\d+部分/,
-  /part\s*\d+\s*of\s*\d+/i,
-  /\(续\)|（续）|接上文|续上/,
-  /待续|未完待续/,
-  /\[\d+\/\d+\]/,
-];
 
 // ── 运行时状态 ─────────────────────────────────────────────────────────────────
 const embedCache     = new Map();
@@ -458,7 +391,7 @@ function parseJsonObject(text) {
 
 // ── ★ 事实提取（omlx + 质量过滤 + memory_type + 用户上下文）─────────────────
 async function extractFacts(assistantText, userContext = '') {
-  if (!assistantText || assistantText.length < getMinCaptureChars('unknown')) return [];
+  if (!assistantText || assistantText.length < MIN_CAPTURE_CHARS) return [];
   const sys = '你是记忆提取专家。严格只输出有效JSON数组，不要任何解释或额外文字。';
   const contextLine = userContext
     ? `\n用户提问/上下文（辅助理解）：\n${userContext.slice(0, 400)}\n`
@@ -528,82 +461,21 @@ merge时merged_content填写合并后的完整内容。`;
   return parseJsonObject(out);
 }
 
-// ── v11 信息源类型检测 ────────────────────────────────────────────────────────
-function detectSourceType(content = '', url = '', tags = []) {
-  const text = (content + ' ' + tags.join(' ')).toLowerCase();
-
-  const tradingPat = [/\bbtc\b/, /\beth\b/, /涨跌/, /开多/, /开空/, /入场/, /止损/, /止盈/, /ticker/, /仓位/, /行情/, /汇率/, /coin/];
-  if (tradingPat.some(p => p.test(text))) return 'trading';
-
-  const newsPat = [/今日热点/, /突发/, /热搜/, /刚刚/, /最新消息/, /breaking/, /据报道/];
-  if (newsPat.some(p => p.test(text))) return 'news';
-
-  const platformPat = [/算法/, /完播率/, /推流/, /流量池/, /\bctr\b/, /违禁词/, /审核/, /限流/, /平台规则/];
-  if (platformPat.some(p => p.test(text))) return 'platform_rule';
-
-  const processPat = [/步骤\d/, /第[一二三四五六七八九十\d]+步/, /操作指南/, /工作流/, /\bsop\b/];
-  if (processPat.some(p => p.test(text))) return 'process';
-
-  const chatPat = [/回复模板/, /话术/, /怎么回/, /聊天技巧/, /沟通模板/];
-  if (chatPat.some(p => p.test(text))) return 'chat';
-
-  const socialPat = [/脚本/, /钩子/, /爆款/, /标题公式/, /开头/, /文案结构/];
-  if (socialPat.some(p => p.test(text))) return 'social';
-
-  if (url) {
-    // trading 优先（okx.com 不能被 x.com 误匹配，所以 trading 在前）
-    if (/finance|eastmoney|xueqiu|binance|okx\.com/.test(url)) return 'trading';
-    if (/(?:\/\/)x\.com|twitter\.com|weibo|douyin|xiaohongshu|bilibili/.test(url)) return 'social';
-    if (/news|xinhua|163\.com\/dy/.test(url)) return 'news';
-  }
-
-  if (content.includes('> ') && content.includes('####')) return 'course';
-
-  return 'unknown';
+// ── 时间衰减评分 ──────────────────────────────────────────────────────────────
+function applyTimeDecay(hits) {
+  const now = Date.now();
+  return hits
+    .map(h => {
+      const created = h.payload?.created_at ? new Date(h.payload.created_at).getTime() : now;
+      const ageDays = Math.max(0, (now - created) / 86_400_000);
+      const penalty = Math.min(DECAY_MAX_PENALTY, (ageDays / DECAY_PERIOD_DAYS) * (DECAY_MAX_PENALTY / 2));
+      return { ...h, effectiveScore: h.score * (1 - penalty) };
+    })
+    .sort((a, b) => b.effectiveScore - a.effectiveScore);
 }
 
-// ── v11 知识颗粒度方向检测 ────────────────────────────────────────────────────
-function detectKnowledgePurpose(content = '', tags = [], sourceType = 'unknown') {
-  if (sourceType === 'process') return KNOWLEDGE_PURPOSE.PROCESS;
-  if (/步骤\d|第[一二三四五]步|sop|操作流程/.test(content.toLowerCase())) return KNOWLEDGE_PURPOSE.PROCESS;
-  if (['social', 'chat', 'platform_rule'].includes(sourceType)) return KNOWLEDGE_PURPOSE.PRODUCTION;
-  if (/模板|公式|钩子句|填空|示例文案|脚本框架/.test(content)) return KNOWLEDGE_PURPOSE.PRODUCTION;
-  return KNOWLEDGE_PURPOSE.UNDERSTANDING;
-}
-
-// ── v11 TTL 过期时间计算 ───────────────────────────────────────────────────────
-function calcTTLExpiry(sourceType) {
-  const ttlSeconds = TTL_MAP[sourceType];
-  if (ttlSeconds === null || ttlSeconds === undefined) return null;
-  return new Date(Date.now() + ttlSeconds * 1000).toISOString();
-}
-
-// ── v11 按 source_type 获取最小捕获字符数 ────────────────────────────────────
-function getMinCaptureChars(sourceType) {
-  return MIN_CAPTURE_CHARS_MAP[sourceType] ?? MIN_CAPTURE_CHARS_MAP.unknown;
-}
-
-// ── 时间衰减评分（v11：意图感知，修复精度问题）────────────────────────────────
-function applyTimeDecay(hits, intent = 'relevant') {
-  if (intent === 'latest') {
-    // 最新意图：按创建时间倒序，不用语义分数
-    return [...hits].sort((a, b) => {
-      const ta = a.payload?.created_at ? new Date(a.payload.created_at).getTime() : 0;
-      const tb = b.payload?.created_at ? new Date(b.payload.created_at).getTime() : 0;
-      return tb - ta;
-    }).map(h => ({ ...h, effectiveScore: h.score }));
-  }
-  // 相关意图（默认）：不做时间惩罚，freshness_score 过滤已在 qdrantSearch 处理
-  return hits.map(h => ({ ...h, effectiveScore: h.score }))
-             .sort((a, b) => b.effectiveScore - a.effectiveScore);
-}
-
-// ── v11 衰减速率推断（source_type 优先）──────────────────────────────────────
-function inferDecayRate(domain, tags = [], sourceType = null) {
-  if (sourceType === 'trading' || sourceType === 'news') return 'fast';
-  if (sourceType === 'social' || sourceType === 'chat' || sourceType === 'platform_rule') return 'medium';
-  if (sourceType === 'course' || sourceType === 'process') return 'slow';
-
+// ── v10 衰减速率推断 ──────────────────────────────────────────────────────────
+function inferDecayRate(domain, tags = []) {
   const fastDomains = ['OKX交易'];
   const fastKeywords = ['价格', '行情', '市场', '汇率', 'price', 'market', '报价'];
   if (fastDomains.includes(domain)) return 'fast';
@@ -618,12 +490,6 @@ function inferDecayRate(domain, tags = [], sourceType = null) {
 }
 
 // ── 访问计数 + 自动升级 importance ────────────────────────────────────────────
-// confidence 随 hit_count 增长（指数逼近，永不到1.0）
-// hit=0→0.60, hit=1→0.66, hit=5→0.82, hit=10→0.92, hit=20→0.98
-function calcConfidence(hitCount) {
-  return parseFloat(Math.min(0.99, 1 - (1 - CONFIDENCE_DEFAULT) * Math.pow(0.85, hitCount)).toFixed(2));
-}
-
 async function trackAccess(hits) {
   for (const h of hits) {
     const hitCount  = (h.payload?.hit_count ?? 0) + 1;
@@ -632,15 +498,10 @@ async function trackAccess(hits) {
     const threshold = HIT_UPGRADE[imp];
     const newImp    = (threshold && hitCount >= threshold && impIdx < IMPORTANCE_LEVELS.length - 1)
       ? IMPORTANCE_LEVELS[impIdx + 1] : imp;
-    const newConf   = calcConfidence(hitCount);
-    const update    = {
-      hit_count:        hitCount,
-      last_accessed_at: new Date().toISOString(),
-      confidence:       newConf,
-    };
+    const update    = { hit_count: hitCount, last_accessed_at: new Date().toISOString() };
     if (newImp !== imp) {
       update.importance = newImp;
-      appendEvolutionLog('UPGRADE', `"${(h.payload?.content ?? '').slice(0, 50)}" ${imp}→${newImp} confidence=${newConf}（访问${hitCount}次）`).catch(() => {});
+      appendEvolutionLog('UPGRADE', `"${(h.payload?.content ?? '').slice(0, 50)}" ${imp}→${newImp}（访问${hitCount}次）`).catch(() => {});
     }
     await httpReq(
       `${QDRANT}/collections/${COLLECTION}/points/payload`, 'POST',
@@ -689,78 +550,11 @@ async function ensureCollection() {
     on_disk_payload:   true,
     optimizers_config: { memmap_threshold: 20000 },
   });
-  if (!create.ok) return false;
-  // v11 新字段索引（方便过滤，异步创建，失败不影响主流程）
-  const indexDefs = [
-    { field_name: 'source_type',       field_schema: 'keyword' },
-    { field_name: 'knowledge_purpose', field_schema: 'keyword' },
-    { field_name: 'platform',          field_schema: 'keyword' },
-    { field_name: 'expires_at',        field_schema: 'datetime' },
-    { field_name: 'domain',            field_schema: 'keyword' },
-    { field_name: 'level',             field_schema: 'integer' },
-    { field_name: 'status',            field_schema: 'keyword' },
-  ];
-  await Promise.allSettled(indexDefs.map(def =>
-    httpReq(`${QDRANT}/collections/${COLLECTION}/index`, 'PUT', def)
-  ));
-  return true;
+  return create.ok;
 }
 
 function stableId(text) {
   return parseInt(createHash('sha256').update(text).digest('hex').slice(0, 15), 16);
-}
-
-// ── v12 实体注册 ──────────────────────────────────────────────────────────────
-async function upsertEntity({ canonical_name, aliases = [], domains = [], definition = '', related_entity_names = [] }) {
-  try {
-    const scrollRes = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', {
-      filter: { must: [
-        { key: 'record_type', match: { value: RECORD_TYPES.ENTITY } },
-        { key: 'canonical_name', match: { value: canonical_name } },
-      ]},
-      limit: 1, with_payload: true, with_vector: false,
-    });
-    const existing = scrollRes?.body?.result?.points?.[0];
-    if (existing) {
-      await httpReq(`${QDRANT}/collections/${COLLECTION}/points/payload`, 'POST', {
-        payload: {
-          aliases:               [...new Set([...(existing.payload.aliases ?? []), ...aliases])],
-          domains:               [...new Set([...(existing.payload.domains ?? []), ...domains])],
-          related_entity_names:  [...new Set([...(existing.payload.related_entity_names ?? []), ...related_entity_names])],
-          updated_at:            new Date().toISOString(),
-        },
-        points: [existing.id],
-      });
-      return { ok: true, entity_id: existing.id, merged: true };
-    }
-    const entityPointId = stableId(canonical_name + '_entity');
-    const vector = await embed((canonical_name + ' ' + definition).slice(0, EMBED_SAFE_CHARS));
-    if (!vector) return { ok: false, error: 'embed failed' };
-    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points?wait=true`, 'PUT', {
-      points: [{ id: entityPointId, vector, payload: {
-        record_type: RECORD_TYPES.ENTITY, canonical_name, aliases, domains, definition,
-        related_entity_names, knowledge_node_ids: [], confidence: CONFIDENCE_DEFAULT,
-        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-      }}],
-    });
-    return { ok: r.ok, entity_id: entityPointId };
-  } catch (err) { return { ok: false, error: err?.message ?? String(err) }; }
-}
-
-async function upsertRelation({ source_id, target_id, relation_type, strength = 0.7, context = '' }) {
-  try {
-    const relationPointId = stableId(String(source_id) + '_' + relation_type + '_' + String(target_id));
-    const embedText = (context || `${source_id} ${relation_type} ${target_id}`).slice(0, EMBED_SAFE_CHARS);
-    const vector = await embed(embedText);
-    if (!vector) return { ok: false, error: 'embed failed' };
-    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points?wait=true`, 'PUT', {
-      points: [{ id: relationPointId, vector, payload: {
-        record_type: RECORD_TYPES.RELATION, source_id, target_id,
-        relation_type, strength, context, created_at: new Date().toISOString(),
-      }}],
-    });
-    return { ok: r.ok, relation_id: relationPointId };
-  } catch (err) { return { ok: false, error: err?.message ?? String(err) }; }
 }
 
 async function upsert(vector, payload) {
@@ -771,54 +565,21 @@ async function upsert(vector, payload) {
   return { ok: r.ok, id, error: r.error };
 }
 
-async function qdrantSearch(vector, {
-  limit = 5, category, domain, minScore = SCORE_MIN, source_type, platform,
-  intent = 'relevant', min_confidence = 0, expand_entities = false, record_type = null,
-} = {}) {
+async function qdrantSearch(vector, { limit = 5, category, domain, minScore = SCORE_MIN } = {}) {
   const body = { vector, limit, with_payload: true, score_threshold: minScore };
-  const now = new Date().toISOString();
-  const mustNot = [
-    { key: 'status', match: { value: 'superseded' } },
-    { key: 'status', match: { value: 'archived' } },
-    { key: 'expires_at', range: { lt: now } },
-  ];
+  // ★ 永远过滤 superseded 版本
+  const mustNot = [{ key: 'status', match: { value: 'superseded' } }];
   const must = [];
   if (category && category !== 'any') must.push({ key: 'category', match: { value: category } });
   if (domain && domain !== 'any') must.push({ key: 'domain', match: { value: domain } });
-  if (source_type) must.push({ key: 'source_type', match: { value: source_type } });
-  if (platform) must.push({ key: 'platform', match: { text: platform } });
-  if (record_type) {
-    must.push({ key: 'record_type', match: { value: record_type } });
-  } else {
-    mustNot.push({ key: 'record_type', match: { value: RECORD_TYPES.ENTITY } });
-    mustNot.push({ key: 'record_type', match: { value: RECORD_TYPES.RELATION } });
-  }
-  if (min_confidence > 0) must.push({ key: 'confidence', range: { gte: min_confidence } });
   body.filter = must.length ? { must, must_not: mustNot } : { must_not: mustNot };
   const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/search`, 'POST', body);
   if (!r.ok) return [];
-  const baseHits = (r.body?.result ?? []).filter(h =>
+  // ★ 过滤负反馈记忆 + 低鲜度记忆
+  return (r.body?.result ?? []).filter(h =>
     (h.payload?.feedback_score  ?? 1.0) >= FEEDBACK_FILTER_MIN &&
     (h.payload?.freshness_score ?? 1.0) >= FRESHNESS_INJECT_MIN
   );
-  if (!expand_entities || baseHits.length === 0) return baseHits;
-  try {
-    const entityIds = [...new Set(baseHits.flatMap(h => h.payload?.entity_ids ?? []).filter(Boolean))];
-    if (!entityIds.length) return baseHits;
-    const scrollR = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', {
-      limit: limit * 2, with_payload: true,
-      filter: { must: [{ key: 'entity_ids', match: { any: entityIds } }], must_not: mustNot },
-    });
-    if (!scrollR.ok) return baseHits;
-    const expanded = (scrollR.body?.result?.points ?? []).filter(h =>
-      (h.payload?.feedback_score  ?? 1.0) >= FEEDBACK_FILTER_MIN &&
-      (h.payload?.freshness_score ?? 1.0) >= FRESHNESS_INJECT_MIN
-    );
-    const seen = new Set(baseHits.map(h => h.id));
-    const merged = [...baseHits];
-    for (const h of expanded) { if (!seen.has(h.id)) { seen.add(h.id); merged.push({ ...h, score: h.score ?? 0 }); } }
-    return merged.sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, limit);
-  } catch { return baseHits; }
 }
 
 async function qdrantDelete(ids) {
@@ -1772,8 +1533,7 @@ async function restoreDynamicDomains(logger) {
 }
 
 // ── v10 L0 原料统一摄入 ───────────────────────────────────────────────────────
-async function intakeToL0({ content, domain, topic, source = 'manual', tags = [], category = 'work', importance = 'medium', memory_type = 'fact', sessionKey, knowledge_type = 'capture',
-  group_id, chunk_index, group_total, content_type = 'other', source_meta = null }) {
+async function intakeToL0({ content, domain, topic, source = 'manual', tags = [], category = 'work', importance = 'medium', memory_type = 'fact', sessionKey, knowledge_type = 'capture' }) {
   return writeQueue.push(WRITE_PRIORITY.CAPTURE, async () => {
     const domainDir = DOMAIN_DIRS[domain] ?? null;
     const level0Dir = OBSIDIAN_VAULT ? join(OBSIDIAN_VAULT, 'L0') : null;
@@ -1808,11 +1568,7 @@ async function intakeToL0({ content, domain, topic, source = 'manual', tags = []
     if (!vector) return { ok: false, error: 'embed failed' };
     await ensureCollection();
     const now = new Date().toISOString();
-    // v11: source_type 自动检测
-    const source_type      = detectSourceType(content, '', Array.isArray(tags) ? tags : []);
-    const knowledge_purpose = detectKnowledgePurpose(content, Array.isArray(tags) ? tags : [], source_type);
-    const expires_at       = calcTTLExpiry(source_type);
-    const decay_rate       = inferDecayRate(domain, tags, source_type);
+    const decay_rate = inferDecayRate(domain, tags);
     const payload = {
       content:            content.trim(),
       category,
@@ -1841,26 +1597,7 @@ async function intakeToL0({ content, domain, topic, source = 'manual', tags = []
       completeness_score: null,
       completeness_gaps:  [],
       domain_score:       null,  // 由整理Agent晋升L1时填入
-      // v11 新增字段
-      source_type,
-      knowledge_purpose,
-      expires_at,
-      platform:           source_meta?.platform ?? null,
-      // v12 新增字段
-      group_id:           group_id    ?? null,
-      chunk_index:        chunk_index ?? null,
-      group_total:        group_total ?? null,
-      content_type:       content_type ?? 'other',
-      source_meta:        source_meta  ?? null,
-      record_type:        RECORD_TYPES.KNOWLEDGE,
-      confidence:         CONFIDENCE_DEFAULT,
-      entity_ids:         [],
-      relation_ids:       [],
     };
-    // 分片信号自动检测
-    if (!payload.group_id && FRAGMENT_SIGNALS.some(p => p.test(content))) {
-      payload.group_id = `grp_${Date.now().toString(36)}`;
-    }
     return upsert(vector, payload);
   });
 }
@@ -1896,64 +1633,106 @@ async function matchDomainForVector(vector) {
   return { domain: null, score: bestScore };
 }
 
-// ── v12 extractL1Content（DeepSeek only · 多节点输出 · 实体+关系提取）────────
-async function extractL1Content(content, domain, contentType = 'other') {
-  const systemPrompt = `你是知识提炼专家。从原始内容中提取结构化知识节点、实体和关系。
+// Pass 0：识别内容类型（DeepSeek 优先，omlx 备用）
+async function detectContentType(content) {
+  const sys = '你是知识分类专家。只输出一个单词，不要任何其他内容。';
+  const user =
+    `判断以下内容属于哪种知识类型，只输出对应标签：
+concept（概念定义：解释某个概念是什么）
+argument（论点主张：有逻辑和证据支撑的观点）
+procedure（方法流程：步骤化的操作方法）
+fact（事实观察：陈述客观事实或数据）
+principle（原则规律：可复用的规律或启发）
+
+内容：${content.slice(0, 800)}
+
+只输出以上五个标签之一：`;
+  const raw = (await deepseekGenerate(sys, user, 20)) ?? (await omlxGenerate(sys, user, 20, EXTRACT_TIMEOUT_MS));
+  const t = raw?.trim().toLowerCase() ?? '';
+  if (['concept','argument','procedure','fact','principle'].includes(t)) return t;
+  return 'principle'; // 默认兜底
+}
+
+// Pass 1：按内容类型提取对应字段（DeepSeek 优先，omlx 备用）
+async function extractL1Content(content, domain) {
+  const truncated = content.slice(0, 5000);
+  const contentType = await detectContentType(truncated).catch(() => 'principle');
+
+  const sys = '你是知识整理专家。严格只输出有效JSON对象，不要任何解释或markdown代码块。只提取原文明确陈述的内容，禁止发明原文未提及的事实、数据、例子或论点。';
+
+  // 通用字段（所有类型都要，权重 40%）
+  const universalFields = `
+  "title": "简洁主题标题（8字以内）",
+  "summary": "核心内容摘要（3-5句，保留关键论点）",
+  "key_points": ["要点1", "要点2", "要点3"],
+  "tags": ["标签1", "标签2", "标签3"],
+  "content_type": "${contentType}"`;
+
+  // 按类型选择专用字段（权重 60%）
+  const typeSchemas = {
+    concept: `
+  "definition": "这个概念的精确定义（20-50字）",
+  "scope": "概念的适用范围和边界（15-30字）",
+  "examples": ["具体例子1（10-20字）", "例子2"],
+  "related_concepts": ["关联概念1", "关联概念2"]`,
+    argument: `
+  "claim": "核心论点/主张（15-30字）",
+  "reasoning": "推理链条：前提→逻辑→结论（30-60字）",
+  "evidence": ["支撑证据或案例1", "证据2"],
+  "limitations": "该论点的局限性或适用边界（15-30字）",
+  "counter_evidence": "已知的反例或质疑（15-30字，无则填空字符串）"`,
+    procedure: `
+  "steps": ["步骤1（10-25字）", "步骤2", "步骤3"],
+  "preconditions": "执行前必须满足的条件（15-30字）",
+  "expected_outcome": "正确执行后的预期结果（15-25字）",
+  "edge_cases": "需要特别注意的边界情况（15-30字，无则填空字符串）"`,
+    fact: `
+  "statement": "事实陈述（20-50字，客观准确）",
+  "source_context": "信息来源或背景（15-30字）",
+  "temporal_scope": "时效性：何时有效，是否过时（10-20字）",
+  "confidence": "可信度评估：高/中/低，理由（10-20字）"`,
+    principle: `
+  "rule_statement": "规律/原则的准确表述（15-30字，直接来自原文）",
+  "rationale": "为什么这个规律有效，底层逻辑（20-40字，原文中有则提炼，否则填""）",
+  "applicable_scenarios": "适用的场景和条件（15-30字）",
+  "exceptions": "例外情况：什么时候不适用（15-30字，原文中无则填""）",
+  "examples": ["原文中出现的具体例子（10-20字），原文无例子则填空数组[]"]`,
+  };
+
+  const typeFields = typeSchemas[contentType] ?? typeSchemas.principle;
+
+  const user =
+    `将以下原始内容整理为结构化L1知识节点。
+域：${domain ?? '通用'}  知识类型：${contentType}
+原始内容：${truncated}
+
 严格规则：
 1. 只提取原文中确实存在的信息，不推测不编造
-2. 每个知识节点必须自包含，读者无需其他节点即可理解
-3. 每个节点内容不超过5000字（超过则拆分为多个节点，保持逻辑完整）
-4. 实体：跨域可复用的核心概念（如"钩子句"、"止损位"、"完播率"）
-5. 关系：节点间的逻辑联系
-严格只输出有效JSON，不要任何解释或markdown代码块`;
+2. 所有字段内容必须能在原文中找到对应依据
+3. 原文没有的字段填空字符串""或空数组[]
+4. 在JSON末尾加 "faithfulness_score": 0.0~1.0（1.0=所有字段均直接来自原文，0.5=有推断成分）
 
-  const typeHint = {
-    video_script:    '"hook":"","structure":"","pain_points":[],"cta":"","applicable_scenarios":[]',
-    trading_signal:  '"entry":"","stop_loss":"","take_profit":"","position_size":"","reasoning":"","timeframe":""',
-    sop:             '"steps":[],"preconditions":[],"expected_outcome":"","tools_required":[]',
-    process:         '"steps":[],"preconditions":[],"expected_outcome":"","tools_required":[]',
-  }[contentType] ?? '"key_points":[],"applicable_scenarios":[],"examples":[]';
-
-  const userPrompt = `请从以下内容中提取知识节点、实体和关系。
-领域：${domain ?? '未知'}  内容类型：${contentType}
-
-原始内容：
-${content}
-
-输出格式（严格JSON）：
-{
-  "nodes": [
-    {
-      "title": "节点标题（8字以内）",
-      "summary": "核心摘要（3-5句）",
-      "content": "完整知识内容（不超过5000字，若内容过长请拆分为多个nodes，每个保持逻辑完整）。针对${contentType}类型，请包含：${typeHint}",
-      "content_type": "${contentType}",
-      "knowledge_purpose": "understanding|production|process",
-      "tags": ["标签1","标签2"],
-      "faithfulness_score": 0.85
-    }
-  ],
-  "entities": [
-    { "canonical_name":"实体规范名称","aliases":["别名"],"definition":"简短定义（20-50字）","domains":["适用域"] }
-  ],
-  "relations": [
-    { "source_title":"节点A的title","target_title":"节点B的title","relation_type":"supports|contradicts|extends|depends_on|used_in|evolved_from|cross_domain","strength":0.7,"context":"关系说明" }
-  ]
+输出JSON（必须包含所有以下字段）：
+{${universalFields},${typeFields},
+  "faithfulness_score": 1.0
 }`;
 
-  const raw = await deepseekGenerate(systemPrompt, userPrompt, 3000);
+  const raw = (await deepseekGenerate(sys, user, 1000)) ?? (await omlxGenerate(sys, user, 900, AGENT_OMLX_TIMEOUT_MS));
   if (!raw) return null;
-  const result = parseJsonObject(raw);
-  if (!result || !Array.isArray(result.nodes) || result.nodes.length === 0) return null;
-  for (const node of result.nodes) {
-    if (!node.title || !node.summary) return null;
-    if (node.content?.length > EMBED_SAFE_CHARS) {
-      console.warn(`[extractL1Content] node "${node.title}" content ${node.content.length} chars exceeds safe limit`);
-    }
-  }
-  if (!Array.isArray(result.entities))  result.entities  = [];
-  if (!Array.isArray(result.relations)) result.relations = [];
-  return result;
+  const parsed = parseJsonObject(raw);
+  if (!parsed?.title || !parsed?.summary) return null;
+
+  // 忠实度过滤：自评 < 0.5 说明 LLM 大量推断，标记风险但不丢弃（允许人工复查）
+  const faithfulness = typeof parsed.faithfulness_score === 'number' ? parsed.faithfulness_score : 1.0;
+  parsed.faithfulness_score = parseFloat(faithfulness.toFixed(2));
+  parsed.hallucination_risk = faithfulness < 0.6;
+
+  // 按类型计算完整度
+  parsed.content_type = contentType;
+  const { score, gaps } = calcCompleteness(parsed, contentType);
+  parsed.completeness_score = parseFloat(score.toFixed(2));
+  parsed.completeness_gaps  = gaps;
+  return parsed;
 }
 
 // 按内容类型计算完整度（相对评分，不跨类型比较）
@@ -2096,117 +1875,81 @@ async function writeL1Obsidian(domain, topic, l1Data, sourceL0Path) {
 }
 
 async function runOrganizeAgent(logger) {
-  const log = logger ?? console;
-  const scrollR = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', {
-    filter: { must: [{ key: 'level', match: { value: LEVEL_RAW } }] },
-    limit: ORGANIZE_BATCH_MAX, with_payload: true, with_vector: true,
-  });
-  if (!scrollR.ok) return { processed: 0, promoted: 0, skipped: 0 };
+  // 1. 拉取 level=0 的记录（含向量）
+  let offset = null;
+  const l0Points = [];
+  do {
+    const body = {
+      limit: 50, with_payload: true, with_vector: true,
+      filter: { must: [{ key: 'level', match: { value: LEVEL_RAW } }] },
+    };
+    if (offset != null) body.offset = offset;
+    const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
+    if (!r.ok) break;
+    l0Points.push(...(r.body?.result?.points ?? []));
+    offset = r.body?.result?.next_page_offset ?? null;
+    if (l0Points.length >= ORGANIZE_BATCH_MAX) break;
+  } while (offset != null);
 
-  const l0Points = scrollR.body?.result?.points ?? [];
   if (!l0Points.length) {
-    log.debug?.('[atlas-memory] 整理Agent: 无L0待处理记录');
+    logger?.debug?.('[atlas-memory] 整理Agent: 无L0待处理记录');
     return { processed: 0, promoted: 0, skipped: 0 };
   }
-  log.info?.(`[atlas-memory] 整理Agent: 处理 ${l0Points.length} 条L0记录`);
+
+  logger?.info?.(`[atlas-memory] 整理Agent: 处理 ${l0Points.length} 条L0记录`);
   let promoted = 0, skipped = 0;
 
   for (const pt of l0Points) {
     const content = pt.payload?.content;
-    if (!content?.trim()) { skipped++; continue; }
+    if (!content?.trim() || !pt.vector) { skipped++; continue; }
 
-    // 域匹配
+    // 2. 域匹配：优先使用 L0 存入时已知的 domain（用户明确指定）
     const storedDomain = pt.payload?.domain;
-    let domain, matchScore = 1.0;
+    let match, domain;
     if (storedDomain && DOMAIN_DESCRIPTIONS[storedDomain]) {
       domain = storedDomain;
-    } else if (pt.vector) {
-      const match = await matchDomainForVector(pt.vector).catch(() => null);
-      domain = match?.domain ?? null;
-      matchScore = match?.score ?? 0;
+      match  = { domain, score: 1.0 };
+    } else {
+      match  = await matchDomainForVector(pt.vector);
+      domain = match.domain;
     }
 
-    // DeepSeek 提取（多节点 + 实体 + 关系）
-    const contentType = pt.payload?.content_type ?? 'other';
-    let result;
-    try { result = await extractL1Content(content, domain, contentType); } catch (e) {
-      log.warn?.(`[atlas-memory] extractL1Content failed for ${pt.id}:`, e?.message);
-    }
-    if (!result) { skipped++; continue; }
+    // 3. omlx 提取 L1 结构化内容
+    const l1Data = await extractL1Content(content, domain).catch(() => null);
+    if (!l1Data?.title || !l1Data?.summary) { skipped++; continue; }
 
-    const { nodes, entities, relations } = result;
+    const topic = l1Data.title;
+    const tags  = [...new Set([...(l1Data.tags ?? []), ...(pt.payload?.tags ?? [])])];
+
+    // 4. 写 Obsidian L1 文件
+    const obsidianPath = await writeL1Obsidian(domain, topic, l1Data, pt.payload?.obsidian_path)
+      .catch(() => null);
+
+    // 5. 更新 Qdrant：level→1，domain，topic，obsidian_path
     const now = new Date().toISOString();
-    const nodeIds = [];
-
-    for (let i = 0; i < nodes.length; i++) {
-      const node = nodes[i];
-      const nodeText = (node.content || node.summary).slice(0, EMBED_SAFE_CHARS);
-      const nodeVector = await embed(nodeText).catch(() => null);
-      if (!nodeVector) { nodeIds.push(null); continue; }
-
-      const mergedTags = [...new Set([...(node.tags ?? []), ...(pt.payload?.tags ?? [])])];
-      const nodePayload = {
-        level: LEVEL_KNOWLEDGE, domain: domain ?? '未分类', topic: node.title,
-        content: nodeText, tags: mergedTags, summary: node.summary,
-        knowledge_purpose: node.knowledge_purpose ?? 'understanding',
-        faithfulness_score: node.faithfulness_score ?? 1.0,
-        hallucination_risk: (node.faithfulness_score ?? 1.0) < 0.6,
-        confidence: CONFIDENCE_DEFAULT, record_type: RECORD_TYPES.KNOWLEDGE,
-        entity_ids: [], relation_ids: [], last_verified: now, freshness_score: 1.0,
-        decay_rate: inferDecayRate(domain, mergedTags, pt.payload?.source_type),
-        source_type: pt.payload?.source_type, expires_at: pt.payload?.expires_at,
-        group_id: pt.payload?.group_id ?? null, domain_score: parseFloat(matchScore.toFixed(3)),
-        obsidian_path: i === 0 ? (pt.payload?.obsidian_path ?? null) : null,
-      };
-
-      if (i === 0) {
-        await writeQueue.push(WRITE_PRIORITY.AGENT, () => qdrantPatchPayload(pt.id, nodePayload));
-        nodeIds.push(pt.id);
-        // 写 Obsidian L1 文件（沿用原有逻辑）
-        writeL1Obsidian(domain, node.title, node, pt.payload?.obsidian_path).catch(() => {});
-      } else {
-        const newId = stableId(node.title + String(pt.id) + String(i));
-        await writeQueue.push(WRITE_PRIORITY.AGENT, () =>
-          httpReq(`${QDRANT}/collections/${COLLECTION}/points?wait=true`, 'PUT', {
-            points: [{ id: newId, vector: nodeVector, payload: nodePayload }],
-          })
-        );
-        nodeIds.push(newId);
-      }
-    }
-
-    // 实体注册
-    const entityIds = [];
-    for (const ent of entities) {
-      try {
-        const er = await upsertEntity({ canonical_name: ent.canonical_name, aliases: ent.aliases ?? [],
-          domains: ent.domains ?? [domain].filter(Boolean), definition: ent.definition ?? '' });
-        if (er.ok && er.entity_id != null) entityIds.push(er.entity_id);
-      } catch (e) { log.warn?.(`[atlas-memory] upsertEntity failed: ${ent.canonical_name}`, e?.message); }
-    }
-    if (entityIds.length && nodeIds[0] != null) {
-      await writeQueue.push(WRITE_PRIORITY.AGENT, () => qdrantPatchPayload(nodeIds[0], { entity_ids: entityIds }));
-    }
-
-    // 关系写入
-    const titleToId = {};
-    nodes.forEach((n, i) => { if (nodeIds[i] != null) titleToId[n.title] = nodeIds[i]; });
-    for (const rel of relations) {
-      const srcId = titleToId[rel.source_title];
-      const tgtId = titleToId[rel.target_title];
-      if (!srcId || !tgtId) continue;
-      const rtype = Object.values(RELATION_TYPES).includes(rel.relation_type) ? rel.relation_type : RELATION_TYPES.SUPPORTS;
-      try {
-        await upsertRelation({ source_id: srcId, target_id: tgtId, relation_type: rtype,
-          strength: rel.strength ?? 0.7, context: rel.context ?? '' });
-      } catch (e) { log.warn?.(`[atlas-memory] upsertRelation failed`, e?.message); }
-    }
+    await writeQueue.push(WRITE_PRIORITY.AGENT, async () => {
+      await qdrantPatchPayload(pt.id, {
+        level:              LEVEL_KNOWLEDGE,
+        domain:             domain ?? '未分类',
+        topic,
+        tags,
+        obsidian_path:      obsidianPath,
+        last_verified:      now,
+        freshness_score:    1.0,
+        decay_rate:         inferDecayRate(domain, tags),
+        completeness_score:  l1Data.completeness_score ?? 0,
+        completeness_gaps:   l1Data.completeness_gaps ?? [],
+        domain_score:        parseFloat((match.score ?? 0).toFixed(3)),
+        faithfulness_score:  l1Data.faithfulness_score ?? 1.0,
+        hallucination_risk:  l1Data.hallucination_risk ?? false,
+      });
+    });
 
     promoted++;
-    appendEvolutionLog('ORGANIZE', `L0→L1: [${domain ?? '未分类'}] ${nodes.length}节点 ${entities.length}实体`).catch(() => {});
+    appendEvolutionLog('ORGANIZE', `L0→L1: "${topic}" → [${domain ?? '未分类'}] (匹配度${match.score.toFixed(2)})`).catch(() => {});
   }
 
-  log.info?.(`[atlas-memory] 整理Agent: 晋升${promoted}条, 跳过${skipped}条`);
+  logger?.info?.(`[atlas-memory] 整理Agent: 晋升${promoted}条, 跳过${skipped}条`);
   return { processed: l0Points.length, promoted, skipped };
 }
 
@@ -4041,53 +3784,29 @@ const MCP_TOOL_DEFS = [
 async function mcpExecute(toolName, args) {
   switch (toolName) {
 
-    case 'atlas_intake': {
-      const { content, content_type = 'other', group_id, group_total, chunk_index,
-        source_meta, domain, topic, tags = [], importance = 'medium' } = args;
-      if (!content?.trim()) throw new Error('content 不能为空');
-      const r = await intakeToL0({ content, content_type, group_id, group_total, chunk_index,
-        source_meta, domain, topic, tags: Array.isArray(tags) ? tags : [],
-        importance, source: 'mcp_intake' });
-      if (!r.ok) throw new Error(r.error ?? 'intake 失败');
-      return { ok: true, id: r.id, group_id: r.group_id ?? null,
-        is_fragment: !!(r.group_id), content_type };
-    }
-
     case 'atlas_recall': {
-      const { query, limit = 5, min_score = SCORE_MIN, domain, source_type,
-        intent = 'relevant', min_confidence = 0, expand_entities = false } = args;
+      const { query, limit = 5, min_score = SCORE_MIN, domain } = args;
       if (!query?.trim()) throw new Error('query 不能为空');
       const vector = await embed(query);
-      if (!vector) throw new Error('embed 不可用');
-      const hits = await qdrantSearch(vector, {
-        limit: expand_entities ? limit * 2 : limit,
-        minScore: min_score, domain, source_type, intent, min_confidence, expand_entities,
-      });
-      const sorted = applyTimeDecay(hits, intent).slice(0, limit);
-      trackAccess(sorted).catch(() => {});
-      return sorted.map(h => ({
-        id: h.id, score: h.effectiveScore ?? h.score,
+      if (!vector) throw new Error('Ollama embed 不可用');
+      const hits = await qdrantSearch(vector, { limit, minScore: min_score, domain });
+      return applyTimeDecay(hits).map(h => ({
+        id: h.id, score: h.score,
         level: h.payload?.level ?? 0,
         domain: h.payload?.domain ?? null,
         topic: h.payload?.topic ?? null,
         content: h.payload?.content,
         memory_type: h.payload?.memory_type,
         importance: h.payload?.importance,
-        confidence: h.payload?.confidence ?? null,
         faithfulness_score: h.payload?.faithfulness_score ?? null,
-        entity_ids: h.payload?.entity_ids ?? [],
-        source_type: h.payload?.source_type ?? null,
         created_at: h.payload?.created_at,
       }));
     }
 
     case 'atlas_store': {
-      const { content, importance = 'medium', memory_type = 'fact', tags = [], topic, domain,
-        knowledge_type = 'capture', content_type, group_id, source_meta, platform } = args;
+      const { content, importance = 'medium', memory_type = 'fact', tags = [], topic, domain, knowledge_type = 'capture' } = args;
       if (!content?.trim()) throw new Error('content 不能为空');
-      const r = await intakeToL0({ content, importance, memory_type, tags, topic, domain,
-        source: 'mcp', knowledge_type, content_type, group_id,
-        source_meta: source_meta ? { ...source_meta, platform: source_meta.platform ?? platform } : (platform ? { platform } : null) });
+      const r = await intakeToL0({ content, importance, memory_type, tags, topic, domain, source: 'mcp', knowledge_type });
       if (!r.ok) throw new Error(r.error ?? 'store 失败');
       return { ok: true, id: r.id, deduplicated: r.deduplicated ?? false };
     }
@@ -4097,22 +3816,14 @@ async function mcpExecute(toolName, args) {
         httpReq(`${QDRANT}/collections/${COLLECTION}`),
         getLevelStats(),
       ]);
-      const countByType = async (rt) => {
-        const res = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/count`, 'POST',
-          { filter: { must: [{ key: 'record_type', match: { value: rt } }] }, exact: false });
-        return res.ok ? (res.body?.result?.count ?? 0) : 0;
-      };
-      const [entity_count, relation_count] = await Promise.all([
-        countByType(RECORD_TYPES.ENTITY), countByType(RECORD_TYPES.RELATION),
-      ]);
-      const total = qdrantRes.body?.result?.points_count ?? 0;
       return {
-        version: '12.0.0',
-        total, entity_count, relation_count,
-        knowledge_count: Math.max(0, total - entity_count - relation_count),
+        version: '10.0.0',
+        total: qdrantRes.body?.result?.points_count ?? 0,
         levels: { L0: levels[0], L1: levels[1], L2: levels[2], L3: levels[3] },
-        domains: Object.keys(DOMAIN_DESCRIPTIONS),
-        qdrant_ok: qdrantRes.ok, deepseek_ok: !!DEEPSEEK_API_KEY, mcp_port: MCP_PORT,
+        domains: Object.keys(DOMAIN_DIRS),
+        qdrant_ok:    qdrantRes.ok,
+        deepseek_ok:  !!DEEPSEEK_API_KEY,
+        mcp_port: MCP_PORT,
       };
     }
 
@@ -4184,7 +3895,7 @@ function startMcpServer(logger) {
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name: 'atlas-memory', version: '11.0.0' }));
+      res.end(JSON.stringify({ ok: true, name: 'atlas-memory', version: '10.0.0' }));
       return;
     }
     if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
@@ -4206,7 +3917,7 @@ function startMcpServer(logger) {
           return send({ jsonrpc: '2.0', id: rpcId, result: {
             protocolVersion: '2024-11-05',
             capabilities: { tools: {} },
-            serverInfo: { name: 'atlas-memory', version: '11.0.0' },
+            serverInfo: { name: 'atlas-memory', version: '10.0.0' },
           }});
         }
         if (method === 'notifications/initialized') {
@@ -4286,7 +3997,7 @@ async function runLegacyDomainMigration(logger) {
   return total;
 }
 
-export const description = 'ATLAS Memory v12.0.0 — 多模态自主演化知识系统（L0-L3四层 · 实体注册 · 关系图谱 · 多域并行 · DeepSeek提炼 · 即时录入 · 5Agent全自治 · MCP Server）';
+export const description = 'ATLAS Memory v10.0.0 — 自主演化知识系统（L0-L3四层 · 5Agent全自治 · INJECT层级优先L3→L1 · 新鲜度过滤 · Obsidian源文件读取 · 自动采集 · 分层Obsidian导出 · Git同步 · MCP Server）';
 
 export function register(api) {
   const logger = api.logger;
@@ -4333,49 +4044,6 @@ export function register(api) {
   // Phase 12：结构重组Agent（7天周期，不主动触发首次，等数据积累）
   setInterval(() => runAgent('restructure', () => runRestructureAgent(logger)).catch(() => {}), RESTRUCTURE_INTERVAL_MS);
 
-  // v11 TTL 过期扫描：每小时一次，trading 直接删，其余归档
-  setInterval(async () => {
-    try {
-      const now = new Date().toISOString();
-      let offset = null;
-      const expired = [];
-      do {
-        const body = {
-          limit: 200, with_payload: true, with_vector: false,
-          filter: {
-            must: [{ key: 'expires_at', range: { lt: now } }],
-            must_not: [
-              { key: 'status', match: { value: 'superseded' } },
-              { key: 'status', match: { value: 'archived' } },
-            ],
-          },
-        };
-        if (offset != null) body.offset = offset;
-        const r = await httpReq(`${QDRANT}/collections/${COLLECTION}/points/scroll`, 'POST', body);
-        if (!r.ok) break;
-        expired.push(...(r.body?.result?.points ?? []));
-        offset = r.body?.result?.next_page_offset ?? null;
-      } while (offset != null);
-
-      if (expired.length === 0) return;
-
-      const toDelete  = expired.filter(p => p.payload?.source_type === 'trading').map(p => p.id);
-      const toArchive = expired.filter(p => p.payload?.source_type !== 'trading').map(p => p.id);
-
-      if (toDelete.length > 0)
-        await httpReq(`${QDRANT}/collections/${COLLECTION}/points/delete?wait=true`, 'POST', { points: toDelete });
-      if (toArchive.length > 0)
-        await httpReq(`${QDRANT}/collections/${COLLECTION}/points/payload`, 'POST', {
-          payload: { status: 'archived', archived_at: now }, points: toArchive,
-        });
-
-      appendEvolutionLog('TTL_EXPIRE', `过期处理：删除${toDelete.length}条(trading)，归档${toArchive.length}条`).catch(() => {});
-      logger?.info?.(`[atlas-memory] TTL过期：删除${toDelete.length}，归档${toArchive.length}`);
-    } catch (e) {
-      logger?.debug?.(`[atlas-memory] TTL扫描错误: ${e.message}`);
-    }
-  }, 60 * 60 * 1000);
-
   // 事件驱动：L0积压检测（每5分钟，积压≥10条立即触发整理Agent）
   setInterval(async () => {
     if (agentLocks.get('organize')) return;
@@ -4407,7 +4075,7 @@ export function register(api) {
         // v10：层级优先搜索
         const hits = await qdrantSearchForInject(vector);
         if (!hits.length) return undefined;
-        const decayed = applyTimeDecay(hits, 'relevant');
+        const decayed = applyTimeDecay(hits);
         lastInjectedIds = decayed.map(h => h.id);
         trackAccess(decayed).catch(() => {});
 
@@ -4512,7 +4180,7 @@ export function register(api) {
         const vector  = await embed(query);
         if (!vector) return [];
         const hits    = await qdrantSearch(vector, { limit: maxResults, minScore: 0.50 });
-        const decayed = applyTimeDecay(hits, 'relevant');
+        const decayed = applyTimeDecay(hits);
         return decayed.map(h => ({
           corpus:     'atlas',
           path:       `atlas:${h.id}`,
@@ -4533,101 +4201,55 @@ export function register(api) {
   // TOOLS
   // ══════════════════════════════════════════════════════════════════════════════
 
-  // atlas_intake（v12 新增：统一录入入口）
-  api.registerTool(() => ({
-    name: 'atlas_intake',
-    description: '统一知识录入入口（v12）。接受任意内容，自动检测分片信号，立即写入L0，后台整理Agent异步提炼L1。支持多片段通过group_id关联。',
-    parameters: {
-      type: 'object', required: ['content'],
-      properties: {
-        content:      { type: 'string', description: '原始内容（任意长度）' },
-        content_type: { type: 'string', enum: ['video_script','article','note','chat_log','trading_signal','sop','course','news','social_post','other'], description: '内容类型，影响整理策略' },
-        group_id:     { type: 'string', description: '分片组ID，同一来源多片段共享同一ID' },
-        group_total:  { type: 'number', description: '该组总片段数' },
-        chunk_index:  { type: 'number', description: '当前片段序号（0开始）' },
-        source_meta:  { type: 'object', description: '来源元数据，如 {platform, url, author, recorded_at}' },
-        domain:       { type: 'string', description: '知识域（可选，自动推断）' },
-        topic:        { type: 'string', description: '主题标题（可选）' },
-        tags:         { type: 'array',  items: { type: 'string' } },
-        importance:   { type: 'string', enum: ['low','medium','high','critical'] },
-      },
-    },
-    execute: async (_callId, params) => {
-      const { content, content_type = 'other', group_id, group_total, chunk_index,
-        source_meta, domain, topic, tags = [], importance = 'medium' } = params ?? {};
-      if (!content?.trim()) return jsonResult({ error: 'content 不能为空' });
-      const r = await intakeToL0({ content, content_type, group_id, group_total, chunk_index,
-        source_meta, domain, topic, tags: Array.isArray(tags) ? tags : [], importance, source: 'plugin_intake' });
-      if (!r.ok) return jsonResult({ error: r.error ?? 'intake 失败' });
-      return jsonResult({ ok: true, id: r.id, group_id: r.group_id ?? null,
-        is_fragment: !!(r.group_id), content_type });
-    },
-  }));
-
-  // atlas_store（v12：自由payload + 新字段）
+  // atlas_store
   api.registerTool(() => ({
     name: 'atlas_store',
-    description: '直接存入知识库（v12）。自动检测 source_type 和 TTL。支持任意额外字段，适合Agent已处理好的结构化内容。',
+    description:
+      '将重要信息存入语义记忆库。自动进行冲突检测（与已有记忆矛盾时智能合并/替换），' +
+      '相似度≥0.92时去重跳过。支持 memory_type 分类。',
     parameters: {
       type: 'object', required: ['content'],
-      additionalProperties: true,
       properties: {
-        content:      { type: 'string',  description: '要存储的内容' },
-        importance:   { type: 'string',  enum: ['low', 'medium', 'high', 'critical'], default: 'medium' },
-        memory_type:  { type: 'string',  default: 'fact' },
-        tags:         { type: 'array',   items: { type: 'string' }, default: [] },
-        topic:        { type: 'string' },
-        domain:       { type: 'string' },
-        knowledge_type: { type: 'string' },
-        content_type: { type: 'string' },
-        group_id:     { type: 'string' },
-        source_meta:  { type: 'object' },
-        platform:     { type: 'string' },
+        content:     { type: 'string',  description: '要存储的内容（20-500字）' },
+        category:    { type: 'string',  enum: ['personal', 'work', 'project', 'system', 'learning'], default: 'work' },
+        importance:  { type: 'string',  enum: ['low', 'medium', 'high', 'critical'], default: 'medium' },
+        memory_type: { type: 'string',  enum: ['preference', 'fact', 'skill', 'project', 'constraint', 'event'], default: 'fact' },
+        tags:        { type: 'array',   items: { type: 'string' }, default: [] },
       },
     },
     execute: async (_callId, params) => {
-      const { content, importance = 'medium', memory_type = 'fact', tags = [], topic, domain,
-        knowledge_type = 'capture', content_type, group_id, source_meta, platform } = params ?? {};
+      const { content, category = 'work', importance = 'medium', memory_type = 'fact', tags = [] } = params ?? {};
       if (!content?.trim()) return jsonResult({ error: 'content 不能为空' });
-      const detectedSourceType = detectSourceType(content, '', Array.isArray(tags) ? tags : []);
-      const r = await intakeToL0({ content, importance, memory_type, tags, topic, domain,
-        source: 'plugin', knowledge_type, content_type, group_id,
-        source_meta: source_meta ?? (platform ? { platform } : null) });
-      if (!r.ok) return jsonResult({ error: r.error });
-      return jsonResult({ ok: true, id: r.id, source_type: detectedSourceType,
-        ttl: TTL_MAP[detectedSourceType] ?? 'permanent' });
+      const result = await storeMemory({ content, category, importance, memory_type, tags, source: 'manual' });
+      if (!result.ok) return jsonResult({ error: result.error });
+      if (result.deduplicated) return jsonResult({ ok: true, deduplicated: true, similar: result.similar });
+      if (result.skipped) return jsonResult({ ok: true, skipped: true, reason: result.reason });
+      return jsonResult({ ok: true, id: result.id, category, importance, memory_type });
     },
   }));
 
-  // atlas_recall（v12：实体扩展 + 置信度过滤 + intent）
+  // atlas_recall
   api.registerTool(() => ({
     name: 'atlas_recall',
-    description: '从知识库检索相关知识（v12：实体扩展 + 置信度过滤 + 意图感知 + TTL自动过滤）。',
+    description: '从语义记忆库检索相关知识（向量搜索 + 时间衰减排序 + 访问计数）。',
     parameters: {
       type: 'object', required: ['query'],
       properties: {
-        query:           { type: 'string',  description: '搜索查询（自然语言）' },
-        limit:           { type: 'integer', default: 5, minimum: 1, maximum: 20 },
-        category:        { type: 'string',  enum: ['personal', 'work', 'project', 'system', 'learning', 'any'], default: 'any' },
-        min_score:       { type: 'number',  default: 0.65, minimum: 0.1, maximum: 1.0 },
-        source_type:     { type: 'string',  description: '按信息源类型过滤' },
-        platform:        { type: 'string',  description: '按平台过滤' },
-        intent:          { type: 'string',  enum: ['relevant', 'latest'], default: 'relevant', description: 'relevant=语义相关, latest=时间最新' },
-        min_confidence:  { type: 'number',  default: 0, minimum: 0, maximum: 1, description: '最低置信度（0=不过滤）' },
-        expand_entities: { type: 'boolean', default: false, description: '基于实体扩展搜索范围' },
+        query:       { type: 'string',  description: '搜索查询（自然语言）' },
+        limit:       { type: 'integer', default: 5, minimum: 1, maximum: 20 },
+        category:    { type: 'string',  enum: ['personal', 'work', 'project', 'system', 'learning', 'any'], default: 'any' },
+        min_score:   { type: 'number',  default: 0.65, minimum: 0.1, maximum: 1.0 },
       },
     },
     execute: async (_callId, params) => {
-      const { query, limit = 5, category = 'any', min_score = SCORE_MIN,
-        source_type, platform, intent = 'relevant', min_confidence = 0, expand_entities = false } = params ?? {};
+      const { query, limit = 5, category = 'any', min_score = SCORE_MIN } = params ?? {};
       if (!query?.trim()) return jsonResult({ error: 'query 不能为空', results: [], count: 0 });
-      const vector = await embed(query);
-      if (!vector) return jsonResult({ error: 'embed 不可用', results: [], count: 0 });
-      const hits = await qdrantSearch(vector, { limit: expand_entities ? limit * 2 : limit,
-        category, minScore: min_score, source_type, platform, intent, min_confidence, expand_entities });
-      const sorted = applyTimeDecay(hits, intent).slice(0, limit);
-      trackAccess(sorted).catch(() => {});
-      return jsonResult({ query, count: sorted.length, intent, results: fmtHits(sorted) });
+      const vector  = await embed(query);
+      if (!vector) return jsonResult({ error: 'Ollama embed 不可用', results: [], count: 0 });
+      const hits    = await qdrantSearch(vector, { limit, category, minScore: min_score });
+      const decayed = applyTimeDecay(hits);
+      trackAccess(decayed).catch(() => {});
+      return jsonResult({ query, count: decayed.length, results: fmtHits(decayed) });
     },
   }));
 
@@ -4671,7 +4293,7 @@ export function register(api) {
       const omlxModels   = omlxRes.ok  ? (omlxRes.body?.data   ?? []).map(m => m.id)    : [];
       const total        = embedCacheHits + embedCacheMisses;
       return jsonResult({
-        version: '11.0.0',
+        version: '10.0.0',
         qdrant: {
           ok:         qdrantRes.ok,
           collection: COLLECTION,

@@ -1,30 +1,20 @@
 {
   "id": "atlas-memory",
   "name": "ATLAS Memory",
-  "version": "10.0.0-phase12",
-  "description": "自主演化知识系统 v10 — L0-L3四层 · 5Agent全自治 · MCP Server(8765) · 结构重组Agent(合并/分裂) · 分层Obsidian导出",
+  "version": "12.0.0",
+  "description": "多域自主演化知识系统 v12 — 实体注册 · 关系图 · 14域 · 置信度演化 · DeepSeek · MCP Server(8766)",
   "main": "index.js",
   "author": "ATLAS Team",
   "license": "MIT",
   "configSchema": {
     "type": "object",
     "properties": {
-      "qdrant_url": {
-        "type": "string",
-        "description": "Qdrant HTTP URL，默认 http://127.0.0.1:6333"
-      },
-      "collection": {
-        "type": "string",
-        "description": "Qdrant collection 名，默认 atlas_memories"
-      },
-      "ollama_url": {
-        "type": "string",
-        "description": "Ollama HTTP URL，默认 http://127.0.0.1:11434"
-      },
-      "embed_model": {
-        "type": "string",
-        "description": "嵌入模型，默认 nomic-embed-text:latest"
-      }
+      "qdrant_url":   { "type": "string", "description": "Qdrant HTTP URL，默认 http://127.0.0.1:6333" },
+      "collection":   { "type": "string", "description": "Qdrant collection 名，默认 atlas_memories_v2" },
+      "ollama_url":   { "type": "string", "description": "Ollama HTTP URL（bge-m3 Embed），默认 http://127.0.0.1:11434" },
+      "embed_model":  { "type": "string", "description": "嵌入模型，默认 bge-m3（1024维）" },
+      "deepseek_url": { "type": "string", "description": "DeepSeek API URL，默认 https://api.deepseek.com" },
+      "mcp_port":     { "type": "number", "description": "MCP Server 端口，默认 8766" }
     }
   }
 }

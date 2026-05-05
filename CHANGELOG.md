@@ -1,82 +1,76 @@
 # Changelog
 
-All notable changes to ATLAS-MemoryCore are documented here.
-
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+All notable changes to ATLAS Memory are documented here.
 
 ---
 
-## [v0.1.0] — 2026-05-05
-
-First public release. Marks the point where the OpenClaw plugin is
-stable enough for daily use and the repository is cleaned up to reflect
-actual capabilities.
+## [v12.0.0] — 2026-05-05
 
 ### Added
 
-- **`openclaw-plugin/index.js`** — Production OpenClaw plugin (v10.0):
-  - Four-tier knowledge maturity model: L0 raw → L1 structured → L2 insight → L3 framework
-  - Hierarchical injection: searches L3→L2→L1→L0, injects the most mature context first
-  - `L1CompletionAgent`: background agent that monitors L0 nodes and promotes them to L1
-  - `atlas_feedback` tool: correct/wrong/outdated ratings; negative ratings suppress injection
-  - `atlas_distill`: synthesizes multiple memories into a distilled principle via DeepSeek
-  - `atlas_timeline`: retrieves all memories for a tag, sorted by time
-  - `atlas_evolve`: manual trigger for dedup + expiry cleanup + auto-distill
-  - Obsidian Bridge: exports to `L1/<domain>/`, `L2/`, `L3/` with Dataview-ready frontmatter
-  - LRU embedding cache (200 entries) with 2.5 s timeout guard on every INJECT call
-  - Version chain: superseded memories kept with `status: superseded`, not deleted
-
-- **`scripts/course_to_l1_pipeline.py`** — Batch L1 knowledge extraction:
-  - Reads `.txt` course transcripts, optionally guided by an `.xmind` skeleton
-  - Calls DeepSeek v4-flash (1 M context, 384 K output) to produce structured knowledge docs
-  - Format: `#### N.N [title]` → **核心内容** / **如何运用** / **关联知识** / verbatim quote block
-  - Writes to local `核心知识整理/`, Obsidian `L1/<domain>/`, and Qdrant `atlas_memories`
-  - `--group 1 / --group 2` splits course list for parallel execution without OOM
-
-- **`benchmark/retrieval_comparison.py`** — Real retrieval benchmark:
-  - 10 hand-labeled memories, 6 queries with ground truth
-  - Compares: keyword match vs vanilla vector search vs time-decay reranking
-  - Reports measured P@3, R@3, and actual latency (no simulated `time.sleep`)
+- **实体注册层**：`upsertEntity` — 以 `stableId(canonical_name+'_entity')` 为 Qdrant point ID，保证同名实体幂等写入；支持 aliases、domains、definition 合并更新
+- **关系图**：`upsertRelation` — 7种关系类型（supports / contradicts / extends / depends_on / used_in / evolved_from / cross_domain），stableId 保证幂等
+- **atlas_intake 统一录入入口**：接受任意内容，自动检测分片信号（`第N/M部分`、`Part N of M`、`(续)`、`[N/M]`、`待续`等），立即写入 L0 并触发后台提炼，无需等待
+- **RECORD_TYPES 三元分类**：knowledge / entity / relation，qdrantSearch 默认只返回知识节点，排除实体和关系记录
+- **confidence 自动演化**：`calcConfidence(hitCount) = 1 - 0.4 × 0.85^hitCount`，每次检索命中自动更新，初始 0.60，随使用趋近 0.99
+- **5 个新知识域**：短视频生产、自动化工具、人际沟通、交易投资、新闻热点（总计 14 个域）
+- **extractL1Content 重写**：DeepSeek only（移除 omlx），支持多节点输出（一个 L0 → 多个 L1），同时提取实体和关系，按 content_type 生成类型特定字段（video_script / trading_signal / sop）
+- **runOrganizeAgent 重写**：nodes[0] 复用原 L0 ID，nodes[1+] 新建 point，自动调用 upsertEntity + upsertRelation，更新 entity_ids / relation_ids 反向索引
+- **qdrantSearch 实体扩展**：`expand_entities=true` 时，基于命中节点的 entity_ids 进行 scroll 扩展，召回更多关联节点
+- **atlas_recall 新参数**：`min_confidence`（置信度过滤）、`expand_entities`（实体扩展）、`intent`（relevant/latest）
+- **atlas_stats v12**：返回 entity_count / relation_count / knowledge_count 分类统计
+- **EMBED_SAFE_CHARS = 6000**：bge-m3 8192 token ≈ 6000 中文字安全截断常量
 
 ### Changed
 
-- **`openclaw-plugin/index.js`**: upgraded from v9.5 to v10. Embedding model
-  changed from `nomic-embed-text` (768-dim) to `bge-m3` (1024-dim);
-  Qdrant collection must be rebuilt when upgrading.
-
-- **`src/core/turboquant_compressor.py`**: removed the false attribution to
-  "Google Research 2026". The module implements standard group-wise 4-bit
-  quantization (group_size=128, per-group scale + zero-point). It reduces
-  vector storage by ~75% but does not affect LLM token consumption.
-
-- **`docs/AEGIS_CORTEX_V6.2.md`**: performance table now explicitly marks
-  all numbers as coming from synthetic tests; adds disclaimer.
+- **DeepSeek 模型**：统一使用 `deepseek-v4-flash`，移除 omlx（本地算力不足）
+- **atlas_store**：`additionalProperties: true`，支持任意额外字段透传
+- **intakeToL0**：新增参数 `group_id / chunk_index / group_total / content_type / source_meta`，payload 新增 `record_type / confidence / entity_ids / relation_ids`
 
 ### Removed
 
-- Auto-generated status report files: `PHASE2_COMPLETION.md`,
-  `PHASE3_COMPLETION.md`, `FINAL_PRODUCTION_REPORT.md`,
-  `PRODUCTION_DEPLOYMENT_REPORT.md`, `PROJECT_COMPLETION.md`,
-  `PROJECT_STATUS_V6.2.md`, `DEVELOPMENT_STATUS.md`, `README_V6.md`,
-  `PROJECT_SUMMARY.md`. These were generated during development and
-  contained fabricated timestamps, inflated metrics, and no useful
-  information for users.
-
-- All root-level test/verify scripts moved to `tests/` and `scripts/`.
-
-### Known Limitations
-
-- The `src/` Python package (AEGIS-Cortex v6.2 architecture) is experimental
-  and not integrated with the OpenClaw plugin. Treat it as a separate research
-  branch.
-- The `benchmark/benchmark_v6_vs_v6.2.py` file is kept for history but is
-  entirely simulated and should not be cited as performance evidence.
-- `retrieval_comparison.py` uses a 10-entry test set. Results are directional,
-  not statistically significant.
+- omlx/本地模型依赖（所有 LLM 提炼统一走 DeepSeek）
+- 手动 `atlas_feedback` 驱动的 confidence 提升（已被 hit_count 自动演化取代，feedback 保留为辅助工具）
 
 ---
 
-## [Pre-release] — 2026-04-21 to 2026-05-04
+## [v11.0.0] — 2026-05-04
 
-Rapid iteration during initial development. Changes were not logged individually.
-See git history for details.
+### Added
+
+- `source_type` 字段：区分 mcp / plugin / agent_end / llm_output 等来源
+- TTL 支持：`expires_at` 字段 + 搜索时自动过滤过期记录
+- 意图检索：`intent=latest` 时时间衰减权重加大，`intent=relevant` 为默认语义相关
+- MCP Server 迁移至端口 8766，collection 升级为 `atlas_memories_v2`（bge-m3 1024维）
+- `freshness_score` + `decay_rate`：基于域和来源推断的自然衰减速率
+
+### Changed
+
+- Embed 模型：nomic-embed-text（768维）→ bge-m3（1024维），collection 需重建
+- MCP 端口：8765 → 8766
+
+---
+
+## [v10.0.0] — 2026-05-01
+
+### Added
+
+- 四层知识成熟度：L0 原料 → L1 知识 → L2 洞见 → L3 框架
+- `L1CompletionAgent`：后台自动将 L0 提炼为 L1
+- 分层注入：L3→L2→L1→L0 优先级注入上下文
+- `atlas_feedback`：correct / wrong / outdated 评分
+- `atlas_distill`：手动多节点归纳
+- `atlas_evolve`：域结构重组（合并/分裂）
+- Obsidian Bridge：L1/L2/L3 分层导出
+- LRU Embed 缓存（200条）
+
+### Changed
+
+- 首个稳定生产版本，从 v9.x 重构
+
+---
+
+## [v0.1.0] — 2026-05-05 *(初始公开版本)*
+
+- 首次将 openclaw-plugin 发布到 GitHub
+- 包含 v10 插件主文件和基准测试脚本

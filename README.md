@@ -1,196 +1,227 @@
-# ATLAS Memory v10.0
+# ATLAS Memory v12
 
-> OpenClaw 语义记忆插件 — 自动捕获 · 语义检索 · 知识提炼 · 反馈进化 · L1 课程知识库
+> OpenClaw 语义记忆插件 — 多域知识库 · 实体注册 · 关系图 · 置信度演化 · DeepSeek 提炼
 
 ---
 
 ## 简介
 
-ATLAS Memory 是为 [OpenClaw](https://openclaw.ai) 设计的商业级记忆插件。它让 AI Agent 具备持久化的语义记忆能力：自动捕获对话中的关键信息，在需要时语义检索注入上下文，并随时间自主进化、提炼知识、淘汰错误记忆。
+ATLAS Memory 是为 [OpenClaw](https://openclaw.ai) 设计的持久化知识系统。v12 在原有四层知识成熟度体系的基础上，引入**实体注册层**和**关系图**，让知识节点之间形成有向图结构，支持跨域关联与语义扩展检索。
 
-**v10 核心升级：** 在原有对话记忆基础上，新增四层知识成熟度体系（L0 原料 → L1 知识 → L2 洞见 → L3 框架），支持从课程转录稿批量提炼 L1 结构化知识节点。
-
----
-
-## 架构（四层记忆 + 四层知识成熟度）
-
-```
-INJECT  ──  每次提问前从 Qdrant 语义检索相关记忆注入上下文
-            层级优先搜索（L3→L2→L1→L0）+ LRU 嵌入缓存(200条)
-            时间衰减重排 + 2.5s 超时保护 + 过滤负反馈记忆
-
-CAPTURE ──  对话结束后自动提取事实存入 Qdrant
-            omlx 质量评分(≥7才存) + 冲突检测 + 版本化(旧版标记superseded)
-            每5轮对话触发一次中途捕获，distill写入内容自动去重
-
-LEARN   ──  拦截搜索工具调用，自动学习网页内容
-            分块处理(1500字/块, 300字重叠, 最多5块) + omlx提取
-
-EVOLVE  ──  自动进化：每24h去重+过期清理+自动提炼通则
-            L1CompletionAgent 自动监控并补全缺失知识节点
-            每7天备份，每6h导出 Obsidian Bridge 镜像
-            同标签 ≥5 条记忆自动触发 distill（每次最多3个标签）
-
-知识层级：L0 原料（原始信息）→ L1 知识（结构化笔记）
-         → L2 跨域洞见 → L3 智识框架
-```
+**核心能力：**
+- 任意内容一键录入（`atlas_intake`），自动识别分片、自动提炼
+- bge-m3（1024维）向量检索，DeepSeek deepseek-v4-flash 知识提炼
+- 实体去重注册（`upsertEntity`）+ 关系图（`upsertRelation`）
+- 命中次数自动驱动 confidence 演化，无需用户手动反馈
+- 14 个知识域自动分类，支持域的自动创建与合并
+- MCP Server 端口 8766，兼容所有 MCP 客户端
 
 ---
 
-## 工具列表（13个）
+## 架构
 
-| 工具 | 用途 |
+### 三种记录类型（RECORD_TYPES）
+
+| 类型 | 说明 | Qdrant 存储方式 |
+|------|------|----------------|
+| `knowledge` | 知识节点（L0 原料 / L1 提炼） | 向量 + payload |
+| `entity` | 实体注册（跨域可复用概念） | 向量 + payload，stableId 幂等 |
+| `relation` | 节点间有向关系 | 向量 + payload，stableId 幂等 |
+
+### 七种关系类型（RELATION_TYPES）
+
+`supports` · `contradicts` · `extends` · `depends_on` · `used_in` · `evolved_from` · `cross_domain`
+
+### 知识成熟度（Level）
+
+```
+L0  原料      — 原始录入，待提炼
+L1  知识节点  — DeepSeek 提炼，结构化，confidence 可演化
+L2  洞见      — 多节点归纳（自动）
+L3  框架      — 域级方法论（自动）
+```
+
+### Confidence 演化
+
+```
+初始 confidence = 0.6
+每次被检索命中：confidence = 1 - 0.4 × 0.85^hit_count
+```
+
+| hit_count | confidence |
+|-----------|-----------|
+| 0 | 0.60 |
+| 1 | 0.66 |
+| 5 | 0.82 |
+| 10 | 0.92 |
+| 20 | 0.98 |
+| 50 | 0.99 |
+
+---
+
+## 知识域（14个）
+
+| 域 | 关键词 |
+|----|--------|
+| 短视频生产 | 脚本 剪辑 钩子 开场 爆款 完播率 |
+| 自动化工具 | 自动化 脚本 工作流 OpenClaw MCP |
+| 人际沟通 | 微信聊天 话术 谈判 说服 客户沟通 |
+| 交易投资 | 加密货币 比特币 交易信号 止损 止盈 |
+| 新闻热点 | 热搜 突发 今日热点 实时资讯 |
+| 营销策略 | 转化漏斗 增长黑客 用户画像 |
+| 产品设计 | 用户故事 MVP 原型 |
+| 技术架构 | 微服务 数据库 API 设计 |
+| 认知学习 | 学习方法 记忆 思维模型 |
+| 健康生活 | 运动 营养 睡眠 |
+| 创业商业 | 商业模式 融资 团队 |
+| 内容创作 | 写作 文案 选题 |
+| 职场效率 | GTD 时间管理 |
+| 个人财务 | 预算 记账 理财 |
+
+域支持自动创建（相似度 < 0.88 时）和自动合并（凝聚度 < 0.55 时）。
+
+---
+
+## MCP 工具
+
+### `atlas_intake` — 统一录入入口（推荐）
+
+任意内容录入，自动检测分片信号，立即写 L0，触发后台提炼。
+
+```json
+{
+  "content": "短视频钩子句写法：痛点切入型、好奇心型、利益承诺型...",
+  "content_type": "video_script",
+  "domain": "短视频生产",
+  "tags": ["钩子句", "开场"],
+  "importance": "high"
+}
+```
+
+**分片信号自动检测：** `第1/3部分`、`Part 1 of 3`、`(续)`、`[2/4]`、`待续` 等，自动分配 `group_id` 关联同源分片。
+
+### `atlas_store` — 直接存储
+
+适合 Agent 已处理好的结构化内容，支持任意额外字段（`additionalProperties: true`）。
+
+### `atlas_recall` — 语义检索
+
+```json
+{
+  "query": "短视频钩子句怎么写",
+  "limit": 5,
+  "domain": "短视频生产",
+  "min_confidence": 0.7,
+  "expand_entities": true,
+  "intent": "relevant"
+}
+```
+
+`expand_entities=true` 会基于命中节点的实体 ID 扩展搜索范围，召回相关联的知识节点。
+
+### `atlas_stats` — 统计信息
+
+返回：`total_points` / `entity_count` / `relation_count` / `knowledge_count` / `version`
+
+### 其他工具
+
+| 工具 | 说明 |
 |------|------|
-| `atlas_store` | 手动存入记忆（含冲突检测） |
-| `atlas_recall` | 语义检索记忆（向量搜索 + 时间衰减） |
-| `atlas_feedback` | 反馈评价：correct/wrong/outdated（负评累积自动删除） |
-| `atlas_distill` | 知识提炼：对某标签下的多条经验合成"通则" |
-| `atlas_timeline` | 主题时间线：某标签下所有记忆按时间排序 |
-| `atlas_evolve` | 手动触发进化（去重 + 过期清理 + 自动提炼） |
-| `atlas_merge` | 智能合并近重复记忆 |
-| `atlas_delete` | 按语义相似度删除记忆 |
-| `atlas_stats` | 查看记忆库完整状态 |
-| `atlas_web_learn` | 从 URL 或文本中学习知识 |
-| `atlas_export` | 导出记忆库为 JSON 备份 |
-| `atlas_import` | 从 JSON 备份恢复记忆库 |
-| `atlas_obsidian_sync` | 手动触发 Obsidian Bridge 同步 |
+| `atlas_search` | 带分类/域过滤的向量检索 |
+| `atlas_update` | 修正知识内容 |
+| `atlas_feedback` | 手动标记质量（补充自动演化） |
+| `atlas_distill` | 手动触发多节点归纳 |
+| `atlas_evolve` | 手动触发域结构重组 |
+| `atlas_export` | 导出到 Obsidian |
 
 ---
 
-## L1 课程知识提炼 Pipeline
+## 安装
 
-v10 新增批量课程处理脚本，可将课程转录稿（.txt）提炼为结构化 L1 知识节点并自动写入 Qdrant + Obsidian Vault。
+### 前置要求
 
-### 格式标准
-
-每个知识节点使用以下结构：
-
-```markdown
-#### X.X [知识点标题]
-
-**核心内容**
-[书面语段落：是什么 + 为什么 + 深层逻辑]
-
-**如何运用**
-[实际场景 + 操作方法]
-
-**关联知识**
-[课程内部关联 + 通用知识体系]
-
-> [完整原文，严禁摘要缩短]
-```
-
-### 使用方法
+- [OpenClaw](https://openclaw.ai) >= 2026.4
+- [Qdrant](https://qdrant.tech) 本地运行（默认 `http://127.0.0.1:6333`）
+- [Ollama](https://ollama.ai) + `bge-m3` 模型（1024维 Embed）
+- DeepSeek API Key（用于知识提炼）
 
 ```bash
-# 安装依赖（仅需 Ollama bge-m3 + Qdrant + DeepSeek API Key）
-export DEEPSEEK_API_KEY=your_key_here
+# 安装 bge-m3
+ollama pull bge-m3
 
-# 跑全部课程
-python3 scripts/course_to_l1_pipeline.py
-
-# 并行跑两组（避免内存压力）
-python3 scripts/course_to_l1_pipeline.py --group 1 > logs/group1.log 2>&1 &
-python3 scripts/course_to_l1_pipeline.py --group 2 > logs/group2.log 2>&1 &
+# 启动 Qdrant（Docker）
+docker run -p 6333:6333 qdrant/qdrant
 ```
 
-### 配置
+### 插件安装
 
-编辑 `scripts/course_to_l1_pipeline.py` 中的 `COURSES` 列表，每条格式为：
-```python
-("课程目录名", "课程名", "域", "xmind文件名或None")
+将 `openclaw-plugin/` 目录内容复制到 OpenClaw 的 `hooks/atlas-memory/` 路径下，重启 OpenClaw 生效。
+
+在 `openclaw.json` 的 `plugins.entries` 中配置：
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "atlas-memory": {
+        "enabled": true,
+        "config": {
+          "qdrant_url": "http://127.0.0.1:6333",
+          "collection": "atlas_memories_v2",
+          "ollama_url": "http://127.0.0.1:11434",
+          "embed_model": "bge-m3"
+        }
+      }
+    }
+  },
+  "env": {
+    "vars": {
+      "DEEPSEEK_API_KEY": "sk-..."
+    }
+  }
+}
 ```
 
-脚本自动：
-- 解析 .xmind 思维导图为骨架
-- 按转录稿长度动态计算 token 预算
-- 提炼后写入本地 `核心知识整理/` 目录
-- 同步到 Obsidian Vault `L1/<域>/` 目录
-- 向量化后 upsert 到 Qdrant `atlas_memories` 集合
+### 从 v10/v11 迁移
+
+collection 名称已变更：`atlas_memories` → `atlas_memories_v2`（bge-m3 1024维向量，不兼容旧 768维数据）。
+
+迁移脚本：`scripts/migrate_v1_to_v2.js`
 
 ---
 
-## 模型依赖
+## 配置参数
 
-### 本地模型（必须）
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `qdrant_url` | `http://127.0.0.1:6333` | Qdrant 服务地址 |
+| `collection` | `atlas_memories_v2` | Qdrant collection 名 |
+| `ollama_url` | `http://127.0.0.1:11434` | Ollama 服务地址 |
+| `embed_model` | `bge-m3` | 嵌入模型（1024维） |
+| `deepseek_url` | `https://api.deepseek.com` | DeepSeek API 地址 |
+| `mcp_port` | `8766` | MCP Server 端口 |
 
-| 服务 | 模型 | 用途 |
-|------|------|------|
-| **Qdrant** | — | 向量数据库，1024-dim Cosine |
-| **Ollama** | `bge-m3` | 文本嵌入，1024维 |
-| **omlx** | `Qwen3.5-9B-OptiQ-4bit` | 事实提取 / 冲突检测 |
-
-### 云端模型（可选）
-
-| 服务 | 模型 | 用途 | 触发时机 |
-|------|------|------|---------|
-| **DeepSeek** | `deepseek-v4-flash` | L1 知识提炼（课程转录稿） | pipeline 脚本 / L1CompletionAgent |
-| **DeepSeek** | `deepseek-chat` | 通则提炼 | `atlas_distill` / EVOLVE 24h 扫描 |
-
-**云端模型选型参考：**
-
-| 模型 | 输入/输出（per 1M tokens） | 适合场景 |
-|------|--------------------------|---------|
-| `deepseek-v4-flash` | $0.14 / $0.28 | L1 批量提炼，1M 上下文，384K 输出 |
-| `deepseek-v4-pro` | $1.74 / $3.48 | 高质量提炼，复杂推理 |
-| `deepseek-chat` | $0.28 / $0.42 | 通则蒸馏，性价比最优 |
+环境变量：`DEEPSEEK_API_KEY`、`ATLAS_MCP_PORT`、`ATLAS_QDRANT_URL`、`ATLAS_COLLECTION`
 
 ---
 
-## 快速安装
-
-前置要求：OpenClaw 已安装，Qdrant / Ollama / omlx 已启动。
+## 测试
 
 ```bash
-# 1. 创建插件目录
-mkdir -p ~/.openclaw/hooks/atlas-memory
-
-# 2. 克隆本仓库
-git clone https://github.com/luogangan7-lgtm/ATLAS-MemoryCore /tmp/ATLAS-MemoryCore
-
-# 3. 复制插件文件
-cp /tmp/ATLAS-MemoryCore/openclaw-plugin/index.js ~/.openclaw/hooks/atlas-memory/
-cp /tmp/ATLAS-MemoryCore/openclaw-plugin/openclaw.plugin.json ~/.openclaw/hooks/atlas-memory/
-
-# 4. 复制配置模板并填入 API Key
-cp /tmp/ATLAS-MemoryCore/setup/openclaw.template.json ~/.openclaw/openclaw.json
-
-# 5. 配置 DeepSeek API Key
-export DEEPSEEK_API_KEY=your_key_here
-
-# 6. 启动
-openclaw gateway start
+# 集成测试（需要 Qdrant + bge-m3 + DeepSeek）
+DEEPSEEK_API_KEY=sk-... node tests/integration_test.mjs
 ```
 
-完整安装指南见 [setup/SETUP.md](setup/SETUP.md)。
-
----
-
-## Payload 字段（v10.0）
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `content` | string | 记忆/知识内容 |
-| `level` | int | 知识层级：0=原料, 1=知识, 2=洞见, 3=框架 |
-| `status` | string | active / superseded（版本链） |
-| `domain` | string | 知识域（如"情感学"） |
-| `topic` | string | 主题（课程名·讲次） |
-| `completeness_score` | float | 完整度 0–1.0 |
-| `faithfulness_score` | float | 忠实度 0–1.0 |
-| `tags` | string[] | 标签列表 |
-| `hit_count` | int | 被检索次数 |
-| `feedback_score` | float | 反馈分 0–1.0；低于 0.5 不注入 |
-| `superseded_by` | string | 指向替换该记忆的新版本 ID |
-| `obsidian_path` | string | Obsidian Vault 相对路径 |
-| `source` | string | 来源标识（如"course-transcript-v3"） |
+集成测试覆盖：Qdrant 连通性、bge-m3 Embed、DeepSeek 提炼、实体/关系写入读回、qdrantSearch 过滤、confidence 演化、数据完整性（自动清理测试数据）。
 
 ---
 
 ## 版本历史
 
-| 版本 | 日期 | 主要变更 |
-|------|------|---------|
-| **v10.0** | 2026-05-05 | 四层知识成熟度(L0-L3) + L1CompletionAgent + 课程转录稿 pipeline(course_to_l1_pipeline.py) + bge-m3(1024dim) + 层级优先注入 |
-| v9.5.0 | 2026-05-03 | 反馈回路(atlas_feedback) + 知识提炼(atlas_distill/DeepSeek) + 版本化(superseded) + 主题时间线 + EVOLVE自动提炼 |
-| v9.4.0 | 2026-05-01 | Obsidian Bridge + 主题聚类导出 + 每日进化日志 + Dataview仪表盘 |
-| v9.3.0 | — | 冲突检测 + 质量评分(≥7) + memory_type分类 + omlx替代Ollama提取 |
+见 [CHANGELOG.md](CHANGELOG.md)。
+
+---
+
+## License
+
+MIT
