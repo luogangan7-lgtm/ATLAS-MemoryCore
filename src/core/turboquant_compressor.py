@@ -1,6 +1,12 @@
 """
-TurboQuant压缩模块 - 基于Google Research 2026年算法
-实现KV缓存75%压缩，零Token成本
+分组量化压缩模块 - 向量嵌入的 4-bit 分组量化
+
+对 numpy 数组（embedding vectors）做分组 4-bit 量化：
+将每 group_size 个元素量化为 4-bit 整数（0-15），保存每组的
+scale 和 zero-point，解压时线性还原。压缩比约 25%（4x），
+适合在磁盘/内存中存储大量嵌入向量。
+
+注意：这不能减少发送给 LLM 的 token 数，仅减少向量存储开销。
 """
 
 import numpy as np

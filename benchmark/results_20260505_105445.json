@@ -1,0 +1,83 @@
+{
+  "timestamp": "2026-05-05T02:54:45.759885+00:00",
+  "config": {
+    "embed_model": "bge-m3",
+    "vector_dim": 1024,
+    "k": 3,
+    "n_memories": 10,
+    "n_queries": 6
+  },
+  "queries": [
+    {
+      "text": "如何建立预期吸引对方",
+      "relevant": [
+        "m01",
+        "m02"
+      ],
+      "topic": "情感-预期"
+    },
+    {
+      "text": "故事与沟通的关系",
+      "relevant": [
+        "m04"
+      ],
+      "topic": "情感-沟通"
+    },
+    {
+      "text": "向量数据库怎么做时间衰减",
+      "relevant": [
+        "m06",
+        "m07"
+      ],
+      "topic": "技术-检索"
+    },
+    {
+      "text": "知识库 pipeline 并行运行",
+      "relevant": [
+        "m08",
+        "m09"
+      ],
+      "topic": "项目"
+    },
+    {
+      "text": "bge-m3 嵌入模型",
+      "relevant": [
+        "m05"
+      ],
+      "topic": "技术-嵌入"
+    },
+    {
+      "text": "记忆遗忘和复习时机",
+      "relevant": [
+        "m10",
+        "m07"
+      ],
+      "topic": "记忆科学"
+    }
+  ],
+  "per_query": {
+    "如何建立预期吸引对方": {},
+    "故事与沟通的关系": {},
+    "向量数据库怎么做时间衰减": {},
+    "知识库 pipeline 并行运行": {},
+    "bge-m3 嵌入模型": {},
+    "记忆遗忘和复习时机": {}
+  },
+  "summary": {
+    "keyword": {
+      "mean_precision_at_k": 0.5555555555555556,
+      "mean_recall_at_k": 1.0,
+      "median_latency_ms": 0.05566650361288339
+    },
+    "vector": {
+      "mean_precision_at_k": 0.5,
+      "mean_recall_at_k": 0.9166666666666666,
+      "median_latency_ms": 31.856832996709272
+    },
+    "atlas": {
+      "mean_precision_at_k": 0.38888888888888884,
+      "mean_recall_at_k": 0.75,
+      "median_latency_ms": 31.536958005744964
+    }
+  }
+}
