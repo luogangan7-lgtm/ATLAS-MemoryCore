@@ -74,7 +74,7 @@ const SEARCH_TOOL_KEYWORDS = ['search', 'harvester', 'google', 'brave', 'bing', 
 
 // ── DeepSeek（云端合成，用于 distill）────────────────────────────────────────
 const DEEPSEEK_URL          = 'https://api.deepseek.com';
-const DEEPSEEK_MODEL        = 'deepseek-chat';
+const DEEPSEEK_MODEL        = 'deepseek-v4-flash';
 const DEEPSEEK_TIMEOUT_MS   = 30_000;
 const DEEPSEEK_API_KEY      = process.env.DEEPSEEK_API_KEY ?? '';
 
@@ -4315,7 +4315,7 @@ export function register(api) {
         active_sessions:   sessionTurns.size,
         features: {
           extract_model:   `omlx ${OMLX_MODEL}（4s/次，thinking关闭）`,
-          distill_model:   `deepseek-chat（云端，omlx备用）`,
+          distill_model:   `${DEEPSEEK_MODEL}（云端，omlx备用）`,
           conflict_detect: `开启（agent_end+atlas_store，medium+重要性触发）`,
           quality_filter:  `≥${MIN_QUALITY_SCORE}/10`,
           memory_types:    'preference|fact|skill|project|constraint|event|[distilled]',
